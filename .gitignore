@@ -1,0 +1,19 @@
+# Build output
+.build/
+glance.app/
+glance.iconset/
+AppIcon.icns
+
+# Highlight.js assets fetched by build.sh
+Sources/glance/Resources/highlight.min.js
+Sources/glance/Resources/atom-one-light.min.css
+Sources/glance/Resources/atom-one-dark.min.css
+
+# Xcode / SwiftPM
+*.xcodeproj/
+*.xcworkspace/
+.swiftpm/
+Package.pins
+
+# macOS
+.DS_Store
