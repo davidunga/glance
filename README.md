@@ -13,6 +13,10 @@
 
 ## Install
 
+**[Download the latest release](https://github.com/davidunga/glance/releases/latest)** — unzip and drag to `/Applications`.
+
+Or build from source:
+
 ```sh
 ./build.sh
 open glance.app
