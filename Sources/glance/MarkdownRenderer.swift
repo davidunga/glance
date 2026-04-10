@@ -12,6 +12,135 @@ enum MarkdownRenderer {
 /// Renders a source-code file as a single highlighted code block.
 /// hljs (already loaded by WebView for fenced markdown blocks) sees the
 /// `language-…` class and runs syntax highlighting on it for free.
+// MARK: - CSV
+
+enum CsvRenderer {
+    static func isCsvFile(_ url: URL) -> Bool {
+        let ext = url.pathExtension.lowercased()
+        return ext == "csv" || ext == "tsv"
+    }
+
+    static func render(_ source: String, url: URL) -> String {
+        let separator: Character = url.pathExtension.lowercased() == "tsv" ? "\t" : ","
+        let rows = parse(source, separator: separator)
+        guard let header = rows.first, !header.isEmpty else { return "<p>Empty file.</p>" }
+        let body = rows.dropFirst()
+
+        var html = """
+        <style>
+        main {
+            max-width: none !important;
+            margin: 0 !important;
+            padding: 24px 32px !important;
+        }
+        table.csv { width: 100%; }
+        table.csv th, table.csv td {
+            white-space: nowrap;
+            max-width: 400px;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+        </style>
+        <table class="csv"><thead><tr>
+        """
+        for cell in header {
+            html += "<th>\(escapeHTML(cell))</th>"
+        }
+        html += "</tr></thead><tbody>"
+        for row in body {
+            html += "<tr>"
+            for (i, cell) in row.enumerated() {
+                // Pad short rows to match header width
+                let _ = i  // suppress warning
+                html += "<td>\(escapeHTML(cell))</td>"
+            }
+            // Fill missing columns
+            if row.count < header.count {
+                for _ in row.count..<header.count {
+                    html += "<td></td>"
+                }
+            }
+            html += "</tr>"
+        }
+        html += "</tbody></table>"
+        return html
+    }
+
+    /// Minimal RFC-4180 CSV parser that handles quoted fields.
+    private static func parse(_ source: String, separator: Character) -> [[String]] {
+        var rows: [[String]] = []
+        var row: [String] = []
+        var field = ""
+        var inQuotes = false
+        var i = source.startIndex
+
+        while i < source.endIndex {
+            let c = source[i]
+            if inQuotes {
+                if c == "\"" {
+                    let next = source.index(after: i)
+                    if next < source.endIndex, source[next] == "\"" {
+                        field.append("\"")
+                        i = source.index(after: next)
+                    } else {
+                        inQuotes = false
+                        i = source.index(after: i)
+                    }
+                } else {
+                    field.append(c)
+                    i = source.index(after: i)
+                }
+            } else if c == "\"" {
+                inQuotes = true
+                i = source.index(after: i)
+            } else if c == separator {
+                row.append(field)
+                field = ""
+                i = source.index(after: i)
+            } else if c == "\r" || c == "\n" {
+                row.append(field)
+                field = ""
+                if !row.allSatisfy({ $0.isEmpty }) || rows.isEmpty {
+                    rows.append(row)
+                }
+                row = []
+                // Handle \r\n
+                let next = source.index(after: i)
+                if c == "\r", next < source.endIndex, source[next] == "\n" {
+                    i = source.index(after: next)
+                } else {
+                    i = source.index(after: i)
+                }
+            } else {
+                field.append(c)
+                i = source.index(after: i)
+            }
+        }
+        // Last field
+        if !field.isEmpty || !row.isEmpty {
+            row.append(field)
+            rows.append(row)
+        }
+        return rows
+    }
+
+    private static func escapeHTML(_ s: String) -> String {
+        var out = ""
+        out.reserveCapacity(s.count)
+        for c in s {
+            switch c {
+            case "&": out += "&amp;"
+            case "<": out += "&lt;"
+            case ">": out += "&gt;"
+            default:  out.append(c)
+            }
+        }
+        return out
+    }
+}
+
+// MARK: - Source code
+
 enum CodeRenderer {
     /// Files larger than this skip highlighting entirely — hljs is fast but
     /// rendering a multi-MB highlighted block in WKWebView gets sluggish.

@@ -105,6 +105,7 @@ struct WebView: NSViewRepresentable {
         )
         userContentController.addUserScript(bridgeScript)
         config.userContentController = userContentController
+        config.setURLSchemeHandler(GlanceFileSchemeHandler(), forURLScheme: "glance-file")
 
         let view = GlanceWebView(frame: .zero, configuration: config)
         view.navigationDelegate = context.coordinator
@@ -149,7 +150,8 @@ struct WebView: NSViewRepresentable {
         context.coordinator.lastHTML = html
         context.coordinator.lastFontSize = fontSize
         context.coordinator.lastFontFamily = fontFamily
-        webView.loadHTMLString(wrap(html), baseURL: baseURL ?? Bundle.main.resourceURL)
+        let resolved = resolveLocalPaths(html, base: baseURL)
+        webView.loadHTMLString(wrap(resolved), baseURL: baseURL ?? Bundle.main.resourceURL)
     }
 
     /// Click interceptor injected on every page load. Captures clicks during
@@ -176,6 +178,40 @@ struct WebView: NSViewRepresentable {
         } catch (err) {}
     }, true);
     """
+
+    /// Rewrites relative `<img src="…">` paths to use the custom
+    /// `glance-file://` scheme so WKWebView can load local images.
+    private func resolveLocalPaths(_ html: String, base: URL?) -> String {
+        guard let base = base else { return html }
+        let pattern = #"(<img\s[^>]*?src\s*=\s*")([^"]+)(")"#
+        guard let regex = try? NSRegularExpression(pattern: pattern) else { return html }
+
+        var result = ""
+        var cursor = html.startIndex
+
+        regex.enumerateMatches(in: html, range: NSRange(html.startIndex..., in: html)) { match, _, _ in
+            guard let match = match,
+                  let fullRange = Range(match.range, in: html),
+                  let prefixRange = Range(match.range(at: 1), in: html),
+                  let srcRange = Range(match.range(at: 2), in: html),
+                  let suffixRange = Range(match.range(at: 3), in: html) else { return }
+
+            let src = String(html[srcRange])
+            guard !src.hasPrefix("http://"), !src.hasPrefix("https://"),
+                  !src.hasPrefix("data:"), !src.hasPrefix("glance-file://") else { return }
+
+            let absolutePath = src.hasPrefix("/") ? src : base.appendingPathComponent(src).path
+
+            result += html[cursor..<fullRange.lowerBound]
+            result += html[prefixRange]
+            result += "glance-file://" + absolutePath
+            result += html[suffixRange]
+            cursor = fullRange.upperBound
+        }
+
+        result += html[cursor...]
+        return result
+    }
 
     private func wrap(_ body: String) -> String {
         """
@@ -466,4 +502,33 @@ struct WebView: NSViewRepresentable {
         kbd { background: rgba(255,255,255,0.08); border-color: rgba(255,255,255,0.2); }
     }
     """
+}
+
+// MARK: - Local-file scheme handler
+
+/// Serves local files to WKWebView via the `glance-file://` scheme.
+/// `loadHTMLString` doesn't grant the web process file-read access, so
+/// relative `<img src>` paths are rewritten to use this scheme instead.
+final class GlanceFileSchemeHandler: NSObject, WKURLSchemeHandler {
+    func webView(_ webView: WKWebView, start urlSchemeTask: any WKURLSchemeTask) {
+        guard let url = urlSchemeTask.request.url else {
+            urlSchemeTask.didFailWithError(URLError(.badURL))
+            return
+        }
+        let path = url.path
+        guard let data = FileManager.default.contents(atPath: path) else {
+            urlSchemeTask.didFailWithError(URLError(.fileDoesNotExist))
+            return
+        }
+        let mime = UTType(filenameExtension: url.pathExtension)?.preferredMIMEType
+            ?? "application/octet-stream"
+        let response = URLResponse(url: url, mimeType: mime,
+                                   expectedContentLength: data.count,
+                                   textEncodingName: nil)
+        urlSchemeTask.didReceive(response)
+        urlSchemeTask.didReceive(data)
+        urlSchemeTask.didFinish()
+    }
+
+    func webView(_ webView: WKWebView, stop urlSchemeTask: any WKURLSchemeTask) {}
 }

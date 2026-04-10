@@ -190,7 +190,7 @@ final class MarkdownDocument: ObservableObject {
         let panel = NSOpenPanel()
         panel.allowsMultipleSelection = false
         panel.canChooseDirectories = false
-        let exts = ["md", "markdown", "mdown", "mkd", "mkdn", "txt"]
+        let exts = ["md", "markdown", "mdown", "mkd", "mkdn", "txt", "csv", "tsv"]
         let types = exts.compactMap { UTType(filenameExtension: $0) }
         // `.sourceCode` is the umbrella UTType for every code/script file the
         // system knows about, so it surfaces .py / .swift / .rs / etc. without
@@ -215,7 +215,9 @@ final class MarkdownDocument: ObservableObject {
     func reload() {
         guard let url = currentURL,
               let text = try? String(contentsOf: url, encoding: .utf8) else { return }
-        if CodeRenderer.isCodeFile(url) {
+        if CsvRenderer.isCsvFile(url) {
+            html = CsvRenderer.render(text, url: url)
+        } else if CodeRenderer.isCodeFile(url) {
             html = CodeRenderer.render(text, language: CodeRenderer.language(for: url))
         } else {
             html = MarkdownRenderer.render(text)

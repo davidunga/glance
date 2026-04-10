@@ -14,5 +14,16 @@
     -->
     <key>com.apple.security.network.client</key>
     <true/>
+    <!--
+        Markdown files reference images, stylesheets, etc. via relative
+        paths. The sandbox only grants access to the specific file the
+        user opened, so without broader read access the viewer cannot
+        load those sibling assets. This temporary exception is fine for
+        a locally-signed app (not App Store).
+    -->
+    <key>com.apple.security.temporary-exception.files.absolute-path.read-only</key>
+    <array>
+        <string>/</string>
+    </array>
 </dict>
 </plist>
