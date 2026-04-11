@@ -6,6 +6,9 @@ import UniformTypeIdentifiers
 extension Notification.Name {
     static let glanceExportPDF = Notification.Name("glance.exportPDF")
     static let glancePrint     = Notification.Name("glance.print")
+    static let glanceReload    = Notification.Name("glance.reload")
+    static let glanceCopyText  = Notification.Name("glance.copyText")
+    static let glanceOpenInEditor = Notification.Name("glance.openInEditor")
 }
 
 /// WKWebView subclass that mirrors its window's `effectiveAppearance` when
@@ -42,6 +45,67 @@ final class GlanceWebView: WKWebView {
         applyAppearance()
     }
 
+    // MARK: - Context menu
+
+    override func willOpenMenu(_ menu: NSMenu, with event: NSEvent) {
+        menu.removeAllItems()
+
+        menu.addItem(withTitle: "Copy Document Text",
+                     action: #selector(copyDocumentText), keyEquivalent: "")
+
+        menu.addItem(.separator())
+
+        let currentFont = UserDefaults.standard.string(forKey: "fontFamily") ?? "sans"
+        for (label, key) in [("Sans Serif", "sans"), ("Serif", "serif"), ("Monospace", "mono")] {
+            let item = NSMenuItem(title: label, action: #selector(setFont(_:)), keyEquivalent: "")
+            item.representedObject = key
+            item.state = key == currentFont ? .on : .off
+            menu.addItem(item)
+        }
+
+        menu.addItem(.separator())
+
+        let currentTheme = UserDefaults.standard.string(forKey: "theme") ?? "system"
+        for (label, key) in [("Dark", "dark"), ("Light", "light"), ("System", "system")] {
+            let item = NSMenuItem(title: label, action: #selector(setTheme(_:)), keyEquivalent: "")
+            item.representedObject = key
+            item.state = key == currentTheme ? .on : .off
+            menu.addItem(item)
+        }
+
+        menu.addItem(.separator())
+
+        menu.addItem(withTitle: "Open in Editor",
+                     action: #selector(openInEditor), keyEquivalent: "")
+
+        menu.addItem(withTitle: "Reload",
+                     action: #selector(reloadDocument), keyEquivalent: "")
+    }
+
+    @objc private func copyDocumentText() {
+        NotificationCenter.default.post(name: .glanceCopyText, object: nil)
+    }
+
+    @objc private func setFont(_ sender: NSMenuItem) {
+        guard let key = sender.representedObject as? String else { return }
+        UserDefaults.standard.set(key, forKey: "fontFamily")
+    }
+
+    @objc private func setTheme(_ sender: NSMenuItem) {
+        guard let key = sender.representedObject as? String else { return }
+        UserDefaults.standard.set(key, forKey: "theme")
+    }
+
+    @objc private func openInEditor() {
+        NotificationCenter.default.post(name: .glanceOpenInEditor, object: nil)
+    }
+
+    @objc private func reloadDocument() {
+        NotificationCenter.default.post(name: .glanceReload, object: nil)
+    }
+
+    // MARK: - Appearance
+
     private func applyAppearance() {
         let name: NSAppearance.Name
         if let forced = forcedAppearance {
@@ -63,6 +127,7 @@ struct WebView: NSViewRepresentable {
     /// Directory the markdown file lives in, so relative links and images
     /// resolve against the user's filesystem instead of the app bundle.
     let baseURL: URL?
+    let fileURL: URL?
     let fontSize: Double
     let fontFamily: FontFamily
     /// `nil` for the System theme. When non-nil we pin WKWebView's appearance
@@ -147,10 +212,11 @@ struct WebView: NSViewRepresentable {
             }
             return
         }
-        context.coordinator.lastHTML = html
         context.coordinator.lastFontSize = fontSize
         context.coordinator.lastFontFamily = fontFamily
+        context.coordinator.currentFilePath = fileURL?.path
         let resolved = resolveLocalPaths(html, base: baseURL)
+        context.coordinator.lastHTML = html
         webView.loadHTMLString(wrap(resolved), baseURL: baseURL ?? Bundle.main.resourceURL)
     }
 
@@ -253,6 +319,9 @@ struct WebView: NSViewRepresentable {
         var onOpenInWindow: ((URL) -> Void)?
         private weak var findController: FindController?
         private var observers: [NSObjectProtocol] = []
+        var currentFilePath: String?
+        private var scrollTimer: Timer?
+        private let scrollKey = "scrollPositions"
 
         // MARK: - JS link bridge
 
@@ -307,9 +376,20 @@ struct WebView: NSViewRepresentable {
             observers.append(nc.addObserver(forName: .glancePrint, object: nil, queue: .main) { [weak self] _ in
                 self?.printDocument()
             })
+
+            scrollTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
+                guard let self = self, let path = self.currentFilePath else { return }
+                self.webView?.evaluateJavaScript("window.scrollY") { result, _ in
+                    guard let y = result as? CGFloat, y > 0 else { return }
+                    var positions = UserDefaults.standard.dictionary(forKey: self.scrollKey) as? [String: Double] ?? [:]
+                    positions[path] = Double(y)
+                    UserDefaults.standard.set(positions, forKey: self.scrollKey)
+                }
+            }
         }
 
         deinit {
+            scrollTimer?.invalidate()
             observers.forEach(NotificationCenter.default.removeObserver)
         }
 
@@ -334,6 +414,13 @@ struct WebView: NSViewRepresentable {
             // app. Sandboxed: NSWorkspace.open is allowed for any URL.
             NSWorkspace.shared.open(url)
             decisionHandler(.cancel)
+        }
+
+        func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+            guard let path = currentFilePath,
+                  let positions = UserDefaults.standard.dictionary(forKey: scrollKey) as? [String: Double],
+                  let y = positions[path], y > 0 else { return }
+            webView.evaluateJavaScript("window.scrollTo(0, \(y))", completionHandler: nil)
         }
 
         private func stripFragment(_ url: URL) -> URL? {

@@ -178,7 +178,7 @@ final class MarkdownDocument: ObservableObject {
     /// against the file's location instead of the app bundle.
     @Published private(set) var baseURL: URL?
 
-    private var currentURL: URL?
+    private(set) var currentURL: URL?
     private var pollTimer: Timer?
     private var lastModified: Date?
 
@@ -190,7 +190,7 @@ final class MarkdownDocument: ObservableObject {
         let panel = NSOpenPanel()
         panel.allowsMultipleSelection = false
         panel.canChooseDirectories = false
-        let exts = ["md", "markdown", "mdown", "mkd", "mkdn", "txt", "csv", "tsv"]
+        let exts = ["md", "markdown", "mdown", "mkd", "mkdn", "txt", "csv", "tsv", "json"]
         let types = exts.compactMap { UTType(filenameExtension: $0) }
         // `.sourceCode` is the umbrella UTType for every code/script file the
         // system knows about, so it surfaces .py / .swift / .rs / etc. without
@@ -212,10 +212,24 @@ final class MarkdownDocument: ObservableObject {
         watch(url)
     }
 
+    func openInEditor() {
+        guard let url = currentURL else { return }
+        NSWorkspace.shared.open(url)
+    }
+
+    func copySourceText() {
+        guard let url = currentURL,
+              let text = try? String(contentsOf: url, encoding: .utf8) else { return }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
+    }
+
     func reload() {
         guard let url = currentURL,
               let text = try? String(contentsOf: url, encoding: .utf8) else { return }
-        if CsvRenderer.isCsvFile(url) {
+        if JsonRenderer.isJsonFile(url) {
+            html = JsonRenderer.render(text)
+        } else if CsvRenderer.isCsvFile(url) {
             html = CsvRenderer.render(text, url: url)
         } else if CodeRenderer.isCodeFile(url) {
             html = CodeRenderer.render(text, language: CodeRenderer.language(for: url))

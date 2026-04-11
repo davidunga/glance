@@ -19,6 +19,7 @@ struct ContentView: View {
         ZStack(alignment: .topTrailing) {
             WebView(html: document.html,
                     baseURL: document.baseURL,
+                    fileURL: document.currentURL,
                     fontSize: fontSize,
                     fontFamily: fontFamily,
                     themeOverride: themeOverride,
@@ -58,6 +59,15 @@ struct ContentView: View {
                 }
             }
             return true
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .glanceReload)) { _ in
+            document.reload()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .glanceCopyText)) { _ in
+            document.copySourceText()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .glanceOpenInEditor)) { _ in
+            document.openInEditor()
         }
     }
 }
