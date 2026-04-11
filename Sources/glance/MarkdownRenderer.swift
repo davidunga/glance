@@ -12,6 +12,60 @@ enum MarkdownRenderer {
 /// Renders a source-code file as a single highlighted code block.
 /// hljs (already loaded by WebView for fenced markdown blocks) sees the
 /// `language-…` class and runs syntax highlighting on it for free.
+// MARK: - JSON
+
+enum JsonRenderer {
+    static func isJsonFile(_ url: URL) -> Bool {
+        url.pathExtension.lowercased() == "json"
+    }
+
+    static func render(_ source: String) -> String {
+        // Re-serialize through JSONSerialization for consistent pretty-printing.
+        let pretty: String
+        if let data = source.data(using: .utf8),
+           let obj = try? JSONSerialization.jsonObject(with: data),
+           let formatted = try? JSONSerialization.data(withJSONObject: obj, options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]),
+           let str = String(data: formatted, encoding: .utf8) {
+            pretty = str
+        } else {
+            pretty = source
+        }
+        let escaped = htmlEscape(pretty)
+        return """
+        <style>
+        main {
+            max-width: none !important;
+            margin: 0 !important;
+            padding: 24px 32px !important;
+        }
+        pre.glance-json {
+            margin: 0;
+            padding: 0;
+            background: transparent;
+            border-radius: 0;
+            overflow-x: auto;
+        }
+        pre.glance-json code { font-size: 0.92em; }
+        </style>
+        <pre class="glance-json"><code class="language-json">\(escaped)</code></pre>
+        """
+    }
+
+    private static func htmlEscape(_ s: String) -> String {
+        var out = ""
+        out.reserveCapacity(s.count)
+        for c in s {
+            switch c {
+            case "&": out += "&amp;"
+            case "<": out += "&lt;"
+            case ">": out += "&gt;"
+            default:  out.append(c)
+            }
+        }
+        return out
+    }
+}
+
 // MARK: - CSV
 
 enum CsvRenderer {
