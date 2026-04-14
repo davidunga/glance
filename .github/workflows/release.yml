@@ -23,5 +23,7 @@ jobs:
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
-          files: glance.app.zip
+          files: |
+            glance.app.zip
+            install-cli.sh
           generate_release_notes: true

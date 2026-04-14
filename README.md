@@ -33,9 +33,22 @@ cp -R glance.app /Applications/
 ## CLI
 
 ```sh
-open -a glance file.md         # open a file
-glance --render file.md        # CLI: print rendered HTML to stdout
+open -a glance file.md         # open a file in the GUI
+glance --render file.md        # print rendered HTML to stdout
 ```
+
+**Install the `glance` command** so you can call it directly from the terminal:
+
+1. Download `glance.app.zip` and `install-cli.sh` from the [latest release](https://github.com/davidunga/glance/releases/latest).
+2. Unzip and move `glance.app` to `/Applications`.
+3. Run the installer:
+
+```sh
+chmod +x install-cli.sh
+./install-cli.sh
+```
+
+The script symlinks `glance` into `~/.local/bin` (if on PATH) or `/usr/local/bin`, and tells you what to do if neither is on PATH yet.
 
 ---
 
