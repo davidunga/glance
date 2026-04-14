@@ -106,9 +106,17 @@ struct GlanceCommands: Commands {
             Button("New Tab") { openWindow(value: UUID()) }
                 .keyboardShortcut("t", modifiers: .command)
 
-            Button("Open…") { document?.openPanel() }
-                .keyboardShortcut("o", modifiers: .command)
-                .disabled(document == nil)
+            Button("Open…") {
+                if let doc = document {
+                    doc.openPanel()
+                } else if let url = MarkdownDocument.showOpenPanel() {
+                    // No focused window — open a new one and pass it the URL
+                    // via pendingURL, which ContentView picks up in onAppear.
+                    MarkdownDocument.pendingURL = url
+                    openWindow(value: UUID())
+                }
+            }
+            .keyboardShortcut("o", modifiers: .command)
         }
         CommandGroup(after: .pasteboard) {
             Divider()
@@ -186,7 +194,10 @@ final class MarkdownDocument: ObservableObject {
         self.html = MarkdownDocument.recentsWelcomeHTML()
     }
 
-    func openPanel() {
+    /// Shows an NSOpenPanel and returns the selected URL, or nil if cancelled.
+    /// Shared by instance `openPanel()` (loads into this window) and the
+    /// no-window path in GlanceCommands (routes URL to a newly opened window).
+    static func showOpenPanel() -> URL? {
         let panel = NSOpenPanel()
         panel.allowsMultipleSelection = false
         panel.canChooseDirectories = false
@@ -196,7 +207,15 @@ final class MarkdownDocument: ObservableObject {
         // system knows about, so it surfaces .py / .swift / .rs / etc. without
         // having to enumerate them by extension.
         panel.allowedContentTypes = types + [.plainText, .text, .sourceCode]
-        if panel.runModal() == .OK, let url = panel.url {
+        guard panel.runModal() == .OK else { return nil }
+        return panel.url
+    }
+
+    /// URL to load when the next new window opens, set by CMD+O with no active window.
+    static var pendingURL: URL?
+
+    func openPanel() {
+        if let url = MarkdownDocument.showOpenPanel() {
             load(url)
         }
     }

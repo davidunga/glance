@@ -45,6 +45,13 @@ struct ContentView: View {
             window.tabbingMode = .preferred
             window.tabbingIdentifier = "glance.main"
         })
+        .onAppear {
+            // Consume a URL queued by CMD+O when no window was active.
+            if let url = MarkdownDocument.pendingURL {
+                MarkdownDocument.pendingURL = nil
+                DispatchQueue.main.async { document.load(url) }
+            }
+        }
         .onOpenURL { url in
             // Defer to next runloop tick: synchronously mutating @Published
             // state during initial scene setup races with SwiftUI's layout
