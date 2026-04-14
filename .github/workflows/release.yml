@@ -18,12 +18,12 @@ jobs:
         run: ./build.sh
 
       - name: Zip app bundle
-        run: ditto -c -k --keepParent glance.app glance.app.zip
+        run: ditto -c -k --keepParent Glance.app Glance.app.zip
 
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            glance.app.zip
+            Glance.app.zip
             install-cli.sh
           generate_release_notes: true

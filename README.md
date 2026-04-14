@@ -1,6 +1,6 @@
 <h1 align="center">
   <img src="docs/icon.png" width="96" alt="glance icon"><br>
-  glance
+  Glance
 </h1>
 
 <p align="center">
@@ -19,7 +19,7 @@ Or build from source:
 
 ```sh
 ./build.sh
-open glance.app
+open Glance.app
 ```
 
 The script fetches highlight.js into `Sources/glance/Resources/`, builds with SwiftPM, assembles a `.app` bundle, and signs it with the entitlements in `glance.entitlements`. Requires Swift 5.9+ and macOS 13+.
@@ -27,20 +27,20 @@ The script fetches highlight.js into `Sources/glance/Resources/`, builds with Sw
 Then install:
 
 ```sh
-cp -R glance.app /Applications/
+cp -R Glance.app /Applications/
 ```
 
 ## CLI
 
 ```sh
-open -a glance file.md         # open a file in the GUI
+open -a Glance file.md         # open a file in the GUI
 glance --render file.md        # print rendered HTML to stdout
 ```
 
 **Install the `glance` command** so you can call it directly from the terminal:
 
-1. Download `glance.app.zip` and `install-cli.sh` from the [latest release](https://github.com/davidunga/glance/releases/latest).
-2. Unzip and move `glance.app` to `/Applications`.
+1. Download `Glance.app.zip` and `install-cli.sh` from the [latest release](https://github.com/davidunga/glance/releases/latest).
+2. Unzip and move `Glance.app` to `/Applications`.
 3. Run the installer:
 
 ```sh

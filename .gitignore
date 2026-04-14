@@ -1,6 +1,6 @@
 # Build output
 .build/
-glance.app/
+Glance.app/
 glance.iconset/
 AppIcon.icns
 

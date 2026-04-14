@@ -180,7 +180,7 @@ struct GlanceCommands: Commands {
 
 final class MarkdownDocument: ObservableObject {
     @Published var html: String
-    @Published var title: String = "glance"
+    @Published var title: String = "Glance"
     /// Directory containing the loaded markdown file. Used as the WKWebView
     /// baseURL so relative links (`./other.md`, `images/foo.png`, …) resolve
     /// against the file's location instead of the app bundle.

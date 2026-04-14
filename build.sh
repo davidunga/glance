@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Build glance as a sandboxed macOS .app bundle.
+# Build Glance as a sandboxed macOS .app bundle.
 set -euo pipefail
 cd "$(dirname "$0")"
 
 CONFIG="${CONFIG:-release}"
-APP="glance.app"
+APP="Glance.app"
 HLJS_VERSION="11.9.0"
 HLJS_BASE="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/${HLJS_VERSION}"
 
@@ -73,5 +73,5 @@ codesign --display --entitlements - --xml "$APP" >/dev/null 2>&1 \
     && echo "  ✓ entitlements embedded"
 
 echo "✓ built ./$APP"
-echo "  open ./$APP                # launch"
-echo "  open -a ./$APP file.md     # open a file"
+echo "  open ./$APP                 # launch"
+echo "  open -a ./$APP file.md      # open a file"
