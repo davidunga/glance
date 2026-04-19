@@ -100,19 +100,28 @@ struct GlanceCommands: Commands {
     @FocusedValue(\.document) private var document
     @FocusedValue(\.findController) private var findController
     @Environment(\.openWindow) private var openWindow
+    @ObservedObject private var windowManager = WindowManager.shared
 
     var body: some Commands {
         CommandGroup(replacing: .newItem) {
+            // New Tab is only allowed in the main tab group — detached windows
+            // are treated as tabs themselves, and "tabs inside tabs" isn't a
+            // thing. The macOS system "Window › New Tab" item is a separate
+            // channel; CMD+T is the one we fully control.
             Button("New Tab") { openWindow(value: UUID()) }
                 .keyboardShortcut("t", modifiers: .command)
+                .disabled(!windowManager.keyWindowCanCreateTabs)
 
             Button("Open…") {
+                guard let url = MarkdownDocument.showOpenPanel() else { return }
+                let canonical = url.standardizedFileURL
+                // Uniqueness: if this file is already open somewhere, focus it.
+                guard !WindowManager.shared.focusExistingTab(for: canonical) else { return }
                 if let doc = document {
-                    doc.openPanel()
-                } else if let url = MarkdownDocument.showOpenPanel() {
-                    // No focused window — open a new one and pass it the URL
-                    // via pendingURL, which ContentView picks up in onAppear.
-                    MarkdownDocument.pendingURL = url
+                    doc.load(canonical)
+                } else {
+                    // No window at all — open a new one carrying the URL.
+                    MarkdownDocument.pendingURL = canonical
                     openWindow(value: UUID())
                 }
             }
@@ -178,6 +187,124 @@ struct GlanceCommands: Commands {
     }
 }
 
+// MARK: - WindowManager
+
+/// Enforces three invariants for Glance's tabbed-window model:
+///
+/// 1. **Singleton tab group** — every window is a tab of one "main" NSWindow.
+///    The first window created claims that role; all subsequent ones are added
+///    via `addTabbedWindow` if they didn't auto-merge (via `tabbingIdentifier`).
+///
+/// 2. **Tab–document uniqueness** — opening a URL that is already displayed in
+///    a tab focuses that tab instead of loading a duplicate.
+///
+/// 3. **No tabs-in-tabs** — CMD+T is disabled in windows that have been
+///    detached from the main tab group, because those windows are themselves
+///    conceptually tabs.
+final class WindowManager: ObservableObject {
+
+    static let shared = WindowManager()
+
+    private(set) var mainWindow: NSWindow?
+
+    // Tracks windows we have already processed so addTabbedWindow is called
+    // at most once per NSWindow instance.
+    private var registered  = Set<ObjectIdentifier>()
+    // Canonical file URL → document currently showing that URL.
+    private var urlToDoc    = [URL: MarkdownDocument]()
+    // Window identity → document living in that window.
+    private var windowToDoc = [ObjectIdentifier: MarkdownDocument]()
+
+    /// Drives the CMD+T enabled state in GlanceCommands.
+    @Published private(set) var keyWindowCanCreateTabs = true
+
+    private var observers: [Any] = []
+
+    private init() {
+        let nc = NotificationCenter.default
+        observers.append(nc.addObserver(
+            forName: NSWindow.didBecomeKeyNotification, object: nil, queue: .main
+        ) { [weak self] note in
+            guard let self, let w = note.object as? NSWindow else { return }
+            self.keyWindowCanCreateTabs = self.isInMainGroup(w)
+        })
+        observers.append(nc.addObserver(
+            forName: NSWindow.willCloseNotification, object: nil, queue: .main
+        ) { [weak self] note in
+            guard let self, let w = note.object as? NSWindow else { return }
+            self.windowWillClose(w)
+        })
+    }
+
+    // MARK: – Registration (called from ContentView's WindowAccessor)
+
+    /// Wire a window and its document into the manager. Safe to call multiple
+    /// times for the same window — only the first call does real work.
+    func register(window: NSWindow, document: MarkdownDocument) {
+        let id = ObjectIdentifier(window)
+        windowToDoc[id] = document
+        guard !registered.contains(id) else { return }
+        registered.insert(id)
+
+        if mainWindow == nil {
+            // Very first window — it becomes the permanent main host.
+            mainWindow = window
+            keyWindowCanCreateTabs = true
+        } else if !isInMainGroup(window) {
+            // Window wasn't auto-grouped (e.g. opened while a detached window
+            // was key) — slot it into the main group explicitly.
+            mainWindow?.addTabbedWindow(window, ordered: .above)
+            window.makeKeyAndOrderFront(nil)
+        }
+    }
+
+    /// Update the URL↔document mapping when a document loads a new file (or
+    /// clears its content). Call this from MarkdownDocument.load(_:).
+    func updateURL(_ url: URL?, for document: MarkdownDocument) {
+        // Drop any stale entry for this document first.
+        urlToDoc = urlToDoc.filter { $0.value !== document }
+        if let url {
+            urlToDoc[url.standardizedFileURL] = document
+        }
+    }
+
+    // MARK: – Queries
+
+    /// True if `window` is the main window or one of its current tabs.
+    func isInMainGroup(_ window: NSWindow) -> Bool {
+        guard let main = mainWindow else { return true } // no main yet → anything goes
+        if window === main { return true }
+        return main.tabGroup?.windows.contains(window) ?? false
+    }
+
+    /// If `url` is already open in a tab, bring that tab to front and return
+    /// `true`. Returns `false` when no matching tab exists.
+    @discardableResult
+    func focusExistingTab(for url: URL) -> Bool {
+        let canonical = url.standardizedFileURL
+        guard let doc = urlToDoc[canonical] else { return false }
+        guard let wid = windowToDoc.first(where: { $0.value === doc })?.key,
+              let win = NSApp.windows.first(where: { ObjectIdentifier($0) == wid })
+        else { return false }
+        if let group = mainWindow?.tabGroup { group.selectedWindow = win }
+        win.makeKeyAndOrderFront(nil)
+        return true
+    }
+
+    // MARK: – Private
+
+    private func windowWillClose(_ window: NSWindow) {
+        let id = ObjectIdentifier(window)
+        if let doc = windowToDoc.removeValue(forKey: id) {
+            urlToDoc = urlToDoc.filter { $0.value !== doc }
+        }
+        registered.remove(id)
+        if window === mainWindow { mainWindow = nil }
+    }
+}
+
+// MARK: - Document
+
 final class MarkdownDocument: ObservableObject {
     @Published var html: String
     @Published var title: String = "Glance"
@@ -227,6 +354,8 @@ final class MarkdownDocument: ObservableObject {
         // macOS-managed recents list. Persists across launches and is the
         // same store the standard "Open Recent" submenu would read.
         NSDocumentController.shared.noteNewRecentDocumentURL(url)
+        // Keep the URL index in sync so WindowManager can find this tab.
+        WindowManager.shared.updateURL(url, for: self)
         reload()
         watch(url)
     }

@@ -25,7 +25,13 @@ struct ContentView: View {
                     themeOverride: themeOverride,
                     findController: find,
                     onOpenInWindow: { url in
-                        DispatchQueue.main.async { document.load(url) }
+                        // In-page link click (glance-open anchor): honour uniqueness.
+                        DispatchQueue.main.async {
+                            let canonical = url.standardizedFileURL
+                            if !WindowManager.shared.focusExistingTab(for: canonical) {
+                                document.load(canonical)
+                            }
+                        }
                     })
                 .frame(minWidth: 640, minHeight: 480)
 
@@ -39,30 +45,47 @@ struct ContentView: View {
         .focusedSceneValue(\.document, document)
         .focusedSceneValue(\.findController, find)
         .background(WindowAccessor { window in
-            // Force tabbing so File ▸ New Tab merges into the existing
-            // window instead of creating a free-floating one. All windows
-            // share an identifier so they group together.
+            // Set tabbing preferences and register with WindowManager.
+            // WindowManager.register is idempotent — safe to call on every
+            // SwiftUI update; only the first call per window does real work.
             window.tabbingMode = .preferred
             window.tabbingIdentifier = "glance.main"
+            WindowManager.shared.register(window: window, document: document)
         })
         .onAppear {
             // Consume a URL queued by CMD+O when no window was active.
+            // Also apply the uniqueness check: if the pending URL is already
+            // open in another tab, focus that tab and leave this one blank.
             if let url = MarkdownDocument.pendingURL {
                 MarkdownDocument.pendingURL = nil
-                DispatchQueue.main.async { document.load(url) }
+                DispatchQueue.main.async {
+                    if !WindowManager.shared.focusExistingTab(for: url.standardizedFileURL) {
+                        document.load(url)
+                    }
+                }
             }
         }
         .onOpenURL { url in
             // Defer to next runloop tick: synchronously mutating @Published
             // state during initial scene setup races with SwiftUI's layout
             // engine and triggers a RenderBox precondition failure.
-            DispatchQueue.main.async { document.load(url) }
+            DispatchQueue.main.async {
+                let canonical = url.standardizedFileURL
+                if !WindowManager.shared.focusExistingTab(for: canonical) {
+                    document.load(canonical)
+                }
+            }
         }
         .onDrop(of: [.fileURL], isTargeted: nil) { providers in
             guard let provider = providers.first else { return false }
             _ = provider.loadObject(ofClass: URL.self) { url, _ in
                 if let url = url {
-                    DispatchQueue.main.async { document.load(url) }
+                    DispatchQueue.main.async {
+                        let canonical = url.standardizedFileURL
+                        if !WindowManager.shared.focusExistingTab(for: canonical) {
+                            document.load(canonical)
+                        }
+                    }
                 }
             }
             return true
