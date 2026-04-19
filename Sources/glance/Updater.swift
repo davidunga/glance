@@ -196,14 +196,11 @@ enum Updater {
             let newAppPath = try unzip(at: zipPath)
 
             progress.message = "Installing…"
-            try launchInstaller(newAppPath: newAppPath)
+            try replaceInstalledApp(with: newAppPath)
 
             progress.message = "Relaunching…"
-            // Give the installer script a moment to spin up and start waiting
-            // on our PID before we terminate — otherwise the script could miss
-            // the transition and its PID-wait loop starts seeing a dead PID
-            // immediately, which is fine, but the brief grace makes the
-            // sequence obviously correct.
+            try launchRelaunch()
+            // Give the relaunch script a moment to spin up before we exit.
             try? await Task.sleep(nanoseconds: 250_000_000)
             NSApp.terminate(nil)
         } catch {
@@ -284,64 +281,75 @@ enum Updater {
         return candidate
     }
 
-    /// Writes a shell script that:
-    ///  1. Waits (≤30s) for this process's PID to exit.
-    ///  2. Strips `com.apple.quarantine` from the freshly-downloaded bundle
-    ///     — without this, Gatekeeper blocks the relaunch silently and the
-    ///     user sees a broken app after update.
-    ///  3. Replaces `/Applications/Glance.app` with the newly unpacked bundle.
-    ///  4. Clears xattrs on the installed copy too (belt-and-braces) and
-    ///     asserts the executable bit on the main binary (ditto should
-    ///     preserve it, but cross-filesystem or cross-user edge cases exist).
-    ///  5. Relaunches Glance via `open`.
+    /// Replaces `/Applications/Glance.app` with the newly downloaded bundle.
     ///
-    /// The script is spawned with its stdio detached from the parent, so when
-    /// the app terminates the script continues and is reparented to launchd.
-    /// All output is tee'd to `install.log` next to the script for postmortem
-    /// diagnosis when something goes wrong.
-    private static func launchInstaller(newAppPath: URL) throws {
-        let scriptDir = try makeScratchDir()
-        let scriptPath = scriptDir.appendingPathComponent("install.sh")
-        let logPath = scriptDir.appendingPathComponent("install.log")
-
+    /// Done synchronously in the Swift process (rather than a bash script) so
+    /// any failure is surfaced immediately with a user-visible error instead of
+    /// failing silently after the app has already quit.
+    ///
+    /// Step-by-step:
+    ///  1. Strip quarantine/provenance xattrs from the extracted bundle. URLSession
+    ///     marks downloads with `com.apple.quarantine`; ditto propagates it to
+    ///     the extracted contents.
+    ///  2. Remove the old bundle and ditto the new one into /Applications.
+    ///  3. Strip xattrs on the installed copy (belt-and-braces).
+    ///  4. Re-sign with ad-hoc identity, preserving existing entitlements.
+    ///     On macOS 14+ Gatekeeper re-verifies the signature after a
+    ///     programmatic bundle swap, so a fresh signature is required even
+    ///     though the source was already validly signed.
+    ///  5. Assert the executable bit (cross-filesystem copies can lose it).
+    private static func replaceInstalledApp(with newAppPath: URL) throws {
         let dest = "/Applications/Glance.app"
+        let destURL = URL(fileURLWithPath: dest)
+
+        // 1. Strip quarantine from the freshly extracted bundle.
+        run("/usr/bin/xattr", ["-cr", newAppPath.path])
+
+        // 2. Replace the installed bundle atomically (remove then ditto).
+        try? FileManager.default.removeItem(at: destURL)
+        let ditto = Process()
+        ditto.executableURL = URL(fileURLWithPath: "/usr/bin/ditto")
+        ditto.arguments = [newAppPath.path, dest]
+        ditto.standardOutput = Pipe()
+        ditto.standardError = Pipe()
+        try ditto.run()
+        ditto.waitUntilExit()
+        guard ditto.terminationStatus == 0 else {
+            throw UpdaterError.message("Failed to copy update to /Applications (exit \(ditto.terminationStatus)).")
+        }
+
+        // 3. Strip xattrs on the installed copy.
+        run("/usr/bin/xattr", ["-cr", dest])
+
+        // 4. Re-sign ad-hoc, preserving entitlements from the existing signature.
+        run("/usr/bin/codesign", ["--force", "--deep", "--sign", "-",
+                                  "--preserve-metadata=entitlements", dest])
+
+        // 5. Ensure the main binary is executable.
+        run("/bin/chmod", ["+x", "\(dest)/Contents/MacOS/glance"])
+    }
+
+    /// Spawns a minimal detached script whose only job is to wait for this
+    /// process to exit, then `open /Applications/Glance.app`. All the heavy
+    /// lifting (bundle replacement, quarantine strip, re-sign) already happened
+    /// in `replaceInstalledApp` before we get here.
+    private static func launchRelaunch() throws {
+        let scriptDir = try makeScratchDir()
+        let scriptPath = scriptDir.appendingPathComponent("relaunch.sh")
+        let logPath    = scriptDir.appendingPathComponent("relaunch.log")
         let pid = ProcessInfo.processInfo.processIdentifier
 
         let script = """
         #!/bin/bash
-        # Log everything we do — invaluable when diagnosing a broken update.
         exec >> "\(logPath.path)" 2>&1
-        echo "[$(date)] installer start (parent pid=\(pid))"
-
-        # Wait for Glance (pid \(pid)) to exit — up to 30 seconds.
+        echo "[$(date)] waiting for pid \(pid)"
         for _ in $(seq 1 150); do
             if ! kill -0 \(pid) 2>/dev/null; then break; fi
             sleep 0.2
         done
-        echo "[$(date)] parent exited or 30s timeout reached"
-
-        # Clear quarantine xattrs from the downloaded bundle BEFORE installing.
-        # URLSession marks downloaded files with com.apple.quarantine, which
-        # makes Gatekeeper refuse to launch the replacement app — the classic
-        # "update installs but app is broken after" failure mode.
-        /usr/bin/xattr -cr "\(newAppPath.path)" || true
-
-        # Replace the installed bundle. `ditto` preserves xattrs / code signing
-        # metadata — which is why we stripped quarantine on the source first.
-        rm -rf "\(dest)"
-        /usr/bin/ditto "\(newAppPath.path)" "\(dest)"
-
-        # Belt-and-braces: strip xattrs on the installed copy too, and make
-        # sure the main executable is actually executable.
-        /usr/bin/xattr -cr "\(dest)" || true
-        /bin/chmod +x "\(dest)/Contents/MacOS/glance" || true
-
-        # Brief settle before relaunch — lets filesystem metadata flush and
-        # makes the sequence easier to reason about.
         sleep 0.3
-
-        echo "[$(date)] install complete, relaunching"
-        /usr/bin/open "\(dest)"
+        echo "[$(date)] relaunching"
+        /usr/bin/open "/Applications/Glance.app"
         echo "[$(date)] open exit=$?"
         """
         try script.write(to: scriptPath, atomically: true, encoding: .utf8)
@@ -349,23 +357,30 @@ enum Updater {
             [.posixPermissions: NSNumber(value: 0o755)],
             ofItemAtPath: scriptPath.path
         )
-
-        // Ensure the log file exists so the script's `exec >> logPath` has
-        // something to append to on the very first line.
         FileManager.default.createFile(atPath: logPath.path, contents: nil)
 
         let task = Process()
         task.executableURL = URL(fileURLWithPath: "/bin/bash")
         task.arguments = [scriptPath.path]
-        // Detach stdio so the child doesn't die on SIGPIPE when our streams
-        // go away at termination. The script redirects its own stdio to the
-        // log file, so we just null the parent-side handles.
-        task.standardInput = FileHandle.nullDevice
+        task.standardInput  = FileHandle.nullDevice
         task.standardOutput = FileHandle.nullDevice
-        task.standardError = FileHandle.nullDevice
+        task.standardError  = FileHandle.nullDevice
         try task.run()
-        // Deliberately do NOT call waitUntilExit — we want the child to
-        // outlive us.
+        // Deliberately do NOT waitUntilExit — script must outlive us.
+    }
+
+    /// Runs a command, silently ignoring any failure. Used for cleanup steps
+    /// where partial success is acceptable.
+    @discardableResult
+    private static func run(_ executable: String, _ arguments: [String]) -> Int32 {
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: executable)
+        task.arguments = arguments
+        task.standardOutput = Pipe()
+        task.standardError  = Pipe()
+        try? task.run()
+        task.waitUntilExit()
+        return task.terminationStatus
     }
 
     // MARK: - Utilities
