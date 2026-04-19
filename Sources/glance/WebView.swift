@@ -80,15 +80,6 @@ final class GlanceWebView: WKWebView {
 
         menu.addItem(withTitle: "Reload",
                      action: #selector(reloadDocument), keyEquivalent: "")
-
-        // Show a re-attach option only when this window has been dragged out
-        // of the main tab group. There's nothing to re-attach to from inside
-        // the main group itself.
-        if let win = window, WindowManager.shared.isDetached(win) {
-            menu.addItem(.separator())
-            menu.addItem(withTitle: "Re-attach to Main Window",
-                         action: #selector(reattachToMain), keyEquivalent: "")
-        }
     }
 
     @objc private func copyDocumentText() {
@@ -111,11 +102,6 @@ final class GlanceWebView: WKWebView {
 
     @objc private func reloadDocument() {
         NotificationCenter.default.post(name: .glanceReload, object: nil)
-    }
-
-    @objc private func reattachToMain() {
-        guard let win = window else { return }
-        WindowManager.shared.reattach(win)
     }
 
     // MARK: - Appearance

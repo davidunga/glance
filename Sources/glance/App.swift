@@ -21,8 +21,34 @@ enum Theme: String, CaseIterable, Identifiable {
     }
 }
 
+// MARK: - App delegate
+
+/// Two responsibilities:
+/// 1. Quit the app when the last window closes. Glance is a document viewer
+///    with a landing page — when every window is gone, there's nothing to
+///    return to, so keeping a headless process alive is just confusing.
+/// 2. Disable macOS state restoration. A fresh launch should always show the
+///    welcome page, never the previous session's files (and never silently
+///    re-open files that may have moved or been deleted since).
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    func applicationWillFinishLaunching(_ notification: Notification) {
+        // Bypass the "reopen windows on next launch" behavior baked into
+        // NSApplication. Both keys exist for historical reasons — the first is
+        // what the System Settings checkbox writes, the second is what
+        // NSUserDefaults reads on older macOS revisions.
+        UserDefaults.standard.set(false, forKey: "NSQuitAlwaysKeepsWindows")
+        UserDefaults.standard.set(true,  forKey: "ApplePersistenceIgnoreState")
+    }
+
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
+        true
+    }
+}
+
 @main
 struct GlanceApp: App {
+    @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
+
     init() {
         // CLI mode: `glance --render file.md` prints rendered HTML and exits.
         let args = CommandLine.arguments
@@ -35,8 +61,8 @@ struct GlanceApp: App {
             exit(0)
         }
 
-        // Allow new windows in the same group to merge as tabs.
-        NSWindow.allowsAutomaticWindowTabbing = true
+        // Each document gets its own standalone window — no tab merging.
+        NSWindow.allowsAutomaticWindowTabbing = false
     }
 
     @AppStorage("theme") private var theme: Theme = .system
@@ -44,9 +70,8 @@ struct GlanceApp: App {
     @AppStorage("fontFamily") private var fontFamily: FontFamily = .sans
 
     var body: some Scene {
-        // `for: UUID.self` lets `openWindow(value:)` spin up fresh window
-        // instances. Combined with each window's `tabbingMode = .preferred`,
-        // those new windows merge into the focused window as tabs.
+        // `for: UUID.self` lets `openWindow(value:)` spin up fresh,
+        // fully-independent window instances — one document per window.
         WindowGroup(for: UUID.self) { _ in
             ContentView(fontSize: fontSize,
                         fontFamily: fontFamily,
@@ -100,23 +125,20 @@ struct GlanceCommands: Commands {
     @FocusedValue(\.document) private var document
     @FocusedValue(\.findController) private var findController
     @Environment(\.openWindow) private var openWindow
-    @ObservedObject private var windowManager = WindowManager.shared
 
     var body: some Commands {
         CommandGroup(replacing: .newItem) {
-            // New Tab is only allowed in the main tab group — detached windows
-            // are treated as tabs themselves, and "tabs inside tabs" isn't a
-            // thing. The macOS system "Window › New Tab" item is a separate
-            // channel; CMD+T is the one we fully control.
-            Button("New Tab") { openWindow(value: UUID()) }
-                .keyboardShortcut("t", modifiers: .command)
-                .disabled(!windowManager.keyWindowCanCreateTabs)
+            // CMD+N opens a fresh welcome window. CMD+O opens a file (focusing
+            // an existing window if that file is already open). Shift+CMD+N
+            // navigates the current window back to the welcome page.
+            Button("New Window") { openWindow(value: UUID()) }
+                .keyboardShortcut("n", modifiers: .command)
 
             Button("Open…") {
                 guard let url = MarkdownDocument.showOpenPanel() else { return }
                 let canonical = url.standardizedFileURL
                 // Uniqueness: if this file is already open somewhere, focus it.
-                guard !WindowManager.shared.focusExistingTab(for: canonical) else { return }
+                guard !WindowManager.shared.focusExistingWindow(for: canonical) else { return }
                 if let doc = document {
                     doc.load(canonical)
                 } else {
@@ -126,6 +148,10 @@ struct GlanceCommands: Commands {
                 }
             }
             .keyboardShortcut("o", modifiers: .command)
+
+            Button("Reset to Welcome") { document?.resetToWelcome() }
+                .keyboardShortcut("n", modifiers: [.command, .shift])
+                .disabled(document == nil)
         }
         CommandGroup(after: .pasteboard) {
             Divider()
@@ -222,56 +248,31 @@ enum RecentDocuments {
 
 // MARK: - WindowManager
 
-/// Enforces three invariants for Glance's tabbed-window model:
+/// Enforces one invariant: each open document appears in at most one window.
+/// Opening a file that's already displayed focuses the existing window
+/// instead of spawning a duplicate.
 ///
-/// 1. **Singleton tab group** — every window is a tab of one "main" NSWindow.
-///    The first window created claims that role; all subsequent ones are added
-///    via `addTabbedWindow` if they didn't auto-merge (via `tabbingIdentifier`).
+/// Tracks two maps:
+///   - `windowToDoc`: which document lives in which window (populated by
+///     `ContentView.WindowAccessor` via `register`).
+///   - `urlToDoc`: which document currently displays which URL (populated by
+///     `MarkdownDocument.load` / `resetToWelcome` via `updateURL`).
 ///
-/// 2. **Tab–document uniqueness** — opening a URL that is already displayed in
-///    a tab focuses that tab instead of loading a duplicate.
-///
-/// 3. **No tabs-in-tabs** — CMD+T is disabled in windows that have been
-///    detached from the main tab group, because those windows are themselves
-///    conceptually tabs.
+/// Entries are cleaned up on `willCloseNotification`.
 final class WindowManager: ObservableObject {
 
     static let shared = WindowManager()
 
-    private(set) var mainWindow: NSWindow?
-
-    // Tracks windows we have already processed so addTabbedWindow is called
-    // at most once per NSWindow instance.
     private var registered  = Set<ObjectIdentifier>()
     // Canonical file URL → document currently showing that URL.
     private var urlToDoc    = [URL: MarkdownDocument]()
     // Window identity → document living in that window.
     private var windowToDoc = [ObjectIdentifier: MarkdownDocument]()
 
-    /// Drives the CMD+T enabled state in GlanceCommands.
-    @Published private(set) var keyWindowCanCreateTabs = true
-
     private var observers: [Any] = []
 
     private init() {
         let nc = NotificationCenter.default
-        observers.append(nc.addObserver(
-            forName: NSWindow.didBecomeKeyNotification, object: nil, queue: .main
-        ) { [weak self] note in
-            guard let self, let w = note.object as? NSWindow else { return }
-            self.keyWindowCanCreateTabs = self.isInMainGroup(w)
-            self.applyTabbingPolicy(to: w)
-        })
-        // didMove fires throughout (and at the end of) a window-drag — which
-        // is how a tab gets pulled out of a tab group. didBecomeKey is not
-        // enough on its own: when the user grabs a tab, that tab is already
-        // key, so detaching it never triggers another key-change notification.
-        observers.append(nc.addObserver(
-            forName: NSWindow.didMoveNotification, object: nil, queue: .main
-        ) { [weak self] note in
-            guard let self, let w = note.object as? NSWindow else { return }
-            self.applyTabbingPolicy(to: w)
-        })
         observers.append(nc.addObserver(
             forName: NSWindow.willCloseNotification, object: nil, queue: .main
         ) { [weak self] note in
@@ -279,8 +280,6 @@ final class WindowManager: ObservableObject {
             self.windowWillClose(w)
         })
     }
-
-    // MARK: – Registration (called from ContentView's WindowAccessor)
 
     /// Wire a window and its document into the manager. Safe to call multiple
     /// times for the same window — only the first call does real work.
@@ -290,26 +289,16 @@ final class WindowManager: ObservableObject {
         guard !registered.contains(id) else { return }
         registered.insert(id)
 
-        // Make the window willing to participate in tabbing before we try to
-        // join the main group — explicitly .preferred so auto-tabbing kicks
-        // in regardless of the user's system preference.
-        window.tabbingMode = .preferred
-
-        if mainWindow == nil {
-            // Very first window — it becomes the permanent main host.
-            mainWindow = window
-            keyWindowCanCreateTabs = true
-        } else if !isInMainGroup(window) {
-            // Window wasn't auto-grouped (e.g. opened while a detached window
-            // was key) — slot it into the main group explicitly.
-            mainWindow?.addTabbedWindow(window, ordered: .above)
-            window.makeKeyAndOrderFront(nil)
-        }
-        applyTabbingPolicy(to: window)
+        // We never want these windows tabbed together.
+        window.tabbingMode = .disallowed
+        // Don't persist window state across launches — fresh launch is always
+        // a welcome page, per the product requirement.
+        window.isRestorable = false
     }
 
     /// Update the URL↔document mapping when a document loads a new file (or
-    /// clears its content). Call this from MarkdownDocument.load(_:).
+    /// clears its content). Call this from MarkdownDocument.load(_:) /
+    /// resetToWelcome().
     func updateURL(_ url: URL?, for document: MarkdownDocument) {
         // Drop any stale entry for this document first.
         urlToDoc = urlToDoc.filter { $0.value !== document }
@@ -318,73 +307,13 @@ final class WindowManager: ObservableObject {
         }
     }
 
-    // MARK: – Queries
-
-    /// True if `window` is the main window or one of its current tabs.
-    func isInMainGroup(_ window: NSWindow) -> Bool {
-        guard let main = mainWindow else { return true } // no main yet → anything goes
-        if window === main { return true }
-        return main.tabGroup?.windows.contains(window) ?? false
-    }
-
-    /// True if `window` exists outside the main tab group (i.e. the user
-    /// dragged its tab out into a free-standing window).
-    func isDetached(_ window: NSWindow) -> Bool {
-        mainWindow != nil && !isInMainGroup(window)
-    }
-
-    // MARK: – Tabbing policy
-
-    /// Detached windows are conceptually a single tab — no "+" button, no tab
-    /// bar. Setting `tabbingMode = .disallowed` removes the "+" affordance and
-    /// blocks accidental new-tab creation; toggling the tab bar off hides the
-    /// strip for cases where the user had "Show Tab Bar" sticky from before
-    /// the drag-out.
-    ///
-    /// The work is done both immediately and after a short delay because the
-    /// drag-out animation can leave `tabGroup` / `isTabBarVisible` in flux for
-    /// a frame or two before settling.
-    func applyTabbingPolicy(to window: NSWindow) {
-        enforceTabbingPolicy(on: window)
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
-            self?.enforceTabbingPolicy(on: window)
-        }
-    }
-
-    private func enforceTabbingPolicy(on window: NSWindow) {
-        if isInMainGroup(window) {
-            window.tabbingMode = .preferred
-            return
-        }
-        window.tabbingMode = .disallowed
-        // Hide the tab strip whenever it's still visible on a detached window.
-        // No `windows.count` gate: in our model a detached window is always a
-        // singleton, and even if it isn't we'd rather strip the UI than leave
-        // an inconsistent state.
-        if let group = window.tabGroup, group.isTabBarVisible {
-            window.toggleTabBar(nil)
-        }
-    }
-
-    /// Move a detached window's tab back into the main tab group. Called from
-    /// the WebView context menu's "Re-attach to Main Window" item.
-    func reattach(_ window: NSWindow) {
-        guard let main = mainWindow, window !== main, !isInMainGroup(window) else { return }
-        // addTabbedWindow refuses windows whose tabbingMode is .disallowed, so
-        // briefly flip back to .preferred for the move.
-        window.tabbingMode = .preferred
-        main.addTabbedWindow(window, ordered: .above)
-        window.makeKeyAndOrderFront(nil)
-    }
-
-    /// If `url` is already open in a tab, bring that tab to front and return
-    /// `true`. Returns `false` when no matching tab exists.
+    /// If `url` is already open in a window, bring that window to front and
+    /// return `true`. Returns `false` when no matching window exists.
     @discardableResult
-    func focusExistingTab(for url: URL) -> Bool {
+    func focusExistingWindow(for url: URL) -> Bool {
         let canonical = url.standardizedFileURL
         guard let doc = urlToDoc[canonical] else { return false }
         guard let win = window(for: doc) else { return false }
-        if let group = win.tabGroup { group.selectedWindow = win }
         win.makeKeyAndOrderFront(nil)
         return true
     }
@@ -404,12 +333,6 @@ final class WindowManager: ObservableObject {
             urlToDoc = urlToDoc.filter { $0.value !== doc }
         }
         registered.remove(id)
-        if window === mainWindow {
-            // Promote a surviving tab so future windows still merge into the
-            // group. Without this, closing the original main tab leaves
-            // mainWindow == nil and the next opened window starts a new group.
-            mainWindow = window.tabGroup?.windows.first(where: { $0 !== window })
-        }
     }
 }
 
@@ -462,10 +385,26 @@ final class MarkdownDocument: ObservableObject {
         baseURL = url.deletingLastPathComponent()
         title = url.deletingPathExtension().lastPathComponent
         RecentDocuments.add(url)
-        // Keep the URL index in sync so WindowManager can find this tab.
+        // Keep the URL index in sync so WindowManager can find this window.
         WindowManager.shared.updateURL(url, for: self)
         reload()
         watch(url)
+    }
+
+    /// Shift+Cmd+N: navigate this window back to the welcome page. Stops the
+    /// file-watch poller, clears URL/baseURL/title, and re-renders the recents
+    /// list. The WindowManager URL index is cleared so a subsequent CMD+O of
+    /// the previously-loaded file correctly spawns a new window (since this
+    /// window no longer holds it).
+    func resetToWelcome() {
+        pollTimer?.invalidate()
+        pollTimer = nil
+        lastModified = nil
+        currentURL = nil
+        baseURL = nil
+        title = "Glance"
+        WindowManager.shared.updateURL(nil, for: self)
+        html = MarkdownDocument.recentsWelcomeHTML()
     }
 
     func openInEditor() {
