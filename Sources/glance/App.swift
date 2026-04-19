@@ -235,7 +235,7 @@ struct GlanceCommands: Commands {
             }
             .keyboardShortcut("o", modifiers: .command)
 
-            Button("Reset to Welcome") { document?.resetToWelcome() }
+            Button("Reset Window") { document?.resetToWelcome() }
                 .keyboardShortcut("n", modifiers: [.command, .shift])
                 .disabled(document == nil)
         }
@@ -465,6 +465,17 @@ final class MarkdownDocument: ObservableObject {
         self.html = ""
     }
 
+    /// Window title format: `.../parent2/parent1/filename.ext`. Shows just
+    /// enough path context to disambiguate files with the same name across
+    /// different directories without consuming the entire title bar.
+    private static func displayTitle(for url: URL) -> String {
+        let parts = url.pathComponents.filter { $0 != "/" }
+        guard parts.count >= 3 else {
+            return "/" + parts.joined(separator: "/")
+        }
+        return ".../" + parts.suffix(3).joined(separator: "/")
+    }
+
     /// Shows an NSOpenPanel and returns the selected URL, or nil if cancelled.
     /// Shared by instance `openPanel()` (loads into this window) and the
     /// no-window path in GlanceCommands (routes URL to a newly opened window).
@@ -491,7 +502,7 @@ final class MarkdownDocument: ObservableObject {
     func load(_ url: URL) {
         currentURL = url
         baseURL = url.deletingLastPathComponent()
-        title = url.deletingPathExtension().lastPathComponent
+        title = Self.displayTitle(for: url)
         RecentDocuments.add(url)
         // Keep the URL index in sync so WindowManager can find this window.
         WindowManager.shared.updateURL(url, for: self)
@@ -518,6 +529,17 @@ final class MarkdownDocument: ObservableObject {
     func openInEditor() {
         guard let url = currentURL else { return }
         NSWorkspace.shared.open(url)
+    }
+
+    func copyPath() {
+        guard let url = currentURL else { return }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(url.path, forType: .string)
+    }
+
+    func revealInFinder() {
+        guard let url = currentURL else { return }
+        NSWorkspace.shared.activateFileViewerSelecting([url])
     }
 
     func copySourceText() {
@@ -575,12 +597,10 @@ extension MarkdownDocument {
             listBody = #"<div class="recents-empty">No recent files yet.</div>"#
         } else {
             let items = recents.map { url -> String in
-                let name = htmlEscape(url.lastPathComponent)
                 let path = htmlEscape(prettyPath(url))
                 let href = htmlEscapeAttr(url.absoluteString)
                 return #"""
                 <a class="glance-open recent-item" href="\#(href)">
-                    <div class="recent-name">\#(name)</div>
                     <div class="recent-path">\#(path)</div>
                 </a>
                 """#
@@ -595,10 +615,21 @@ extension MarkdownDocument {
             margin: 0 auto !important;
             padding: 72px 24px !important;
         }
-        .open-hint {
-            color: #8a8a8e;
-            font-size: 0.72em;
+        .open-button {
+            display: inline-block;
             margin: 0 0 36px;
+            color: #0a66d0 !important;
+            font-size: 0.92em;
+            text-decoration: none !important;
+            cursor: pointer;
+            user-select: none;
+        }
+        @media (prefers-color-scheme: dark) {
+            .open-button { color: #4a9dff !important; }
+        }
+        .open-button:hover {
+            text-decoration: underline !important;
+            text-underline-offset: 3px;
         }
         .open-hint kbd {
             font: 1em/1 -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
@@ -639,21 +670,15 @@ extension MarkdownDocument {
         .recent-item:hover {
             background: rgba(128, 128, 128, 0.10);
         }
-        .recent-name {
-            font-size: 1.0em;
-            font-weight: 500;
-            margin-bottom: 2px;
-        }
         .recent-path {
-            font-size: 0.78em;
-            color: #8a8a8e;
+            font-size: 0.9em;
             font-family: "SF Mono", ui-monospace, Menlo, monospace;
             white-space: nowrap;
             overflow: hidden;
             text-overflow: ellipsis;
         }
         </style>
-        <p class="open-hint">Press <kbd>⌘O</kbd> to open a file.</p>
+        <a class="glance-action open-button" href="open">Open…</a>
         <div class="recents-label">Recents</div>
         \#(listBody)
         """#

@@ -1,10 +1,9 @@
 #!/usr/bin/env swift
-// Canonical icon generator for Glance.app. Produces a Mac-style squircle
-// page with three text bars and a thin border in the same colour as the
-// bars. Alternate variants (beam, clean, bordered) live alongside this
-// file as separate scripts.
-//
+// Generates an .iconset directory with all the sizes macOS expects.
 // Usage: swift tools/make_icon.swift [output.iconset]
+//
+// The icon IS a page: a near-white rounded square with three text-line bars
+// and a soft warm diagonal beam of light catching the document.
 
 import AppKit
 import Foundation
@@ -15,34 +14,11 @@ let outDir = CommandLine.arguments.dropFirst().first.map(URL.init(fileURLWithPat
 try? FileManager.default.removeItem(at: outDir)
 try FileManager.default.createDirectory(at: outDir, withIntermediateDirectories: true)
 
-/// Superellipse with exponent ≈ 5 — visually indistinguishable from Apple's
-/// iOS/macOS icon squircle. Sampled as a fine polyline (~720 segments) so
-/// even thick strokes render without visible facets.
-func squirclePath(in rect: CGRect, exponent n: CGFloat = 5, steps: Int = 720) -> NSBezierPath {
-    let path = NSBezierPath()
-    let cx = rect.midX
-    let cy = rect.midY
-    let rx = rect.width / 2
-    let ry = rect.height / 2
-    for i in 0...steps {
-        let t = CGFloat(i) / CGFloat(steps) * 2 * .pi
-        let cosT = cos(t)
-        let sinT = sin(t)
-        let x = cx + rx * copysign(pow(abs(cosT), 2 / n), cosT)
-        let y = cy + ry * copysign(pow(abs(sinT), 2 / n), sinT)
-        if i == 0 {
-            path.move(to: CGPoint(x: x, y: y))
-        } else {
-            path.line(to: CGPoint(x: x, y: y))
-        }
-    }
-    path.close()
-    return path
-}
-
 func render(size px: Int) -> Data {
     let s = CGFloat(px)
 
+    // Draw directly into an NSBitmapImageRep — avoids NSImage backing-store
+    // quirks at small sizes (tiffRepresentation fails at 16×16).
     guard let rep = NSBitmapImageRep(
         bitmapDataPlanes: nil,
         pixelsWide: px,
@@ -66,16 +42,19 @@ func render(size px: Int) -> Data {
 
     let ctx = nsCtx.cgContext
     let cs = CGColorSpaceCreateDeviceRGB()
-    let fullRect = CGRect(x: 0, y: 0, width: s, height: s)
 
-    NSGraphicsContext.current?.saveGraphicsState()
-    squirclePath(in: fullRect).addClip()
+    // Big Sur–style rounded square clip — this is the page outline.
+    let radius = s * 0.2237
+    NSBezierPath(roundedRect: CGRect(x: 0, y: 0, width: s, height: s),
+                 xRadius: radius, yRadius: radius).addClip()
 
+    // The page IS the icon. A barely-there top-to-bottom paper gradient
+    // gives it a hint of depth without breaking the "single sheet" read.
     let paper = CGGradient(
         colorsSpace: cs,
         colors: [
-            CGColor(red: 1.000, green: 1.000, blue: 1.000, alpha: 1.0),
-            CGColor(red: 0.930, green: 0.932, blue: 0.945, alpha: 1.0),
+            CGColor(red: 1.000, green: 1.000, blue: 1.000, alpha: 1.0), // top
+            CGColor(red: 0.945, green: 0.945, blue: 0.955, alpha: 1.0), // bottom
         ] as CFArray,
         locations: [0, 1]
     )!
@@ -86,6 +65,8 @@ func render(size px: Int) -> Data {
         options: []
     )
 
+    // Three text bars, centered vertically. Slightly varied widths so it
+    // reads as text rather than abstract stripes.
     let barColor = NSColor(red: 0.62, green: 0.64, blue: 0.69, alpha: 1.0)
     let barInsetX = s * 0.17
     let barAreaWidth = s - barInsetX * 2
@@ -104,16 +85,38 @@ func render(size px: Int) -> Data {
         path.fill()
     }
 
-    NSGraphicsContext.current?.restoreGraphicsState()
+    // Diagonal light beam crossing the page. Drawn in a rotated coordinate
+    // system so we can use a horizontal gradient as the cross-section.
+    ctx.saveGState()
+    ctx.translateBy(x: s / 2, y: s / 2)
+    ctx.rotate(by: -CGFloat.pi / 4) // 45° down-right
 
-    // Thin border in bar colour, stroked flush with the squircle edge.
-    let strokeWidth = max(1, s * 0.012)
-    let inset = strokeWidth / 2
-    let strokePath = squirclePath(in: fullRect.insetBy(dx: inset, dy: inset))
-    strokePath.lineWidth = strokeWidth
-    strokePath.lineJoinStyle = .round
-    barColor.setStroke()
-    strokePath.stroke()
+    let beamWidth = s * 0.34
+    let beamLength = s * 1.7
+    let beamRect = CGRect(
+        x: -beamWidth / 2,
+        y: -beamLength / 2,
+        width: beamWidth,
+        height: beamLength
+    )
+
+    ctx.clip(to: beamRect)
+    let beam = CGGradient(
+        colorsSpace: cs,
+        colors: [
+            CGColor(red: 1.000, green: 0.910, blue: 0.560, alpha: 0.00),
+            CGColor(red: 1.000, green: 0.910, blue: 0.560, alpha: 0.55),
+            CGColor(red: 1.000, green: 0.910, blue: 0.560, alpha: 0.00),
+        ] as CFArray,
+        locations: [0, 0.5, 1]
+    )!
+    ctx.drawLinearGradient(
+        beam,
+        start: CGPoint(x: -beamWidth / 2, y: 0),
+        end:   CGPoint(x:  beamWidth / 2, y: 0),
+        options: []
+    )
+    ctx.restoreGState()
 
     guard let png = rep.representation(using: .png, properties: [:]) else {
         fatalError("PNG encode failed at \(px)px")

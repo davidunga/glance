@@ -9,6 +9,9 @@ extension Notification.Name {
     static let glanceReload    = Notification.Name("glance.reload")
     static let glanceCopyText  = Notification.Name("glance.copyText")
     static let glanceOpenInEditor = Notification.Name("glance.openInEditor")
+    static let glanceCopyPath = Notification.Name("glance.copyPath")
+    static let glanceRevealInFinder = Notification.Name("glance.revealInFinder")
+    static let glanceOpenPanel = Notification.Name("glance.openPanel")
 }
 
 /// WKWebView subclass that mirrors its window's `effectiveAppearance` when
@@ -50,31 +53,6 @@ final class GlanceWebView: WKWebView {
     override func willOpenMenu(_ menu: NSMenu, with event: NSEvent) {
         menu.removeAllItems()
 
-        menu.addItem(withTitle: "Copy Document Text",
-                     action: #selector(copyDocumentText), keyEquivalent: "")
-
-        menu.addItem(.separator())
-
-        let currentFont = UserDefaults.standard.string(forKey: "fontFamily") ?? "sans"
-        for (label, key) in [("Sans Serif", "sans"), ("Serif", "serif"), ("Monospace", "mono")] {
-            let item = NSMenuItem(title: label, action: #selector(setFont(_:)), keyEquivalent: "")
-            item.representedObject = key
-            item.state = key == currentFont ? .on : .off
-            menu.addItem(item)
-        }
-
-        menu.addItem(.separator())
-
-        let currentTheme = UserDefaults.standard.string(forKey: "theme") ?? "system"
-        for (label, key) in [("Dark", "dark"), ("Light", "light"), ("System", "system")] {
-            let item = NSMenuItem(title: label, action: #selector(setTheme(_:)), keyEquivalent: "")
-            item.representedObject = key
-            item.state = key == currentTheme ? .on : .off
-            menu.addItem(item)
-        }
-
-        menu.addItem(.separator())
-
         // Keep-on-top toggle. Reflects the current window level with a
         // checkmark; the action flips it.
         let keepOnTop = NSMenuItem(title: "Keep on Top",
@@ -85,33 +63,35 @@ final class GlanceWebView: WKWebView {
 
         menu.addItem(.separator())
 
+        menu.addItem(withTitle: "Copy Path",
+                     action: #selector(copyPath), keyEquivalent: "")
+
+        menu.addItem(withTitle: "Reveal in Finder",
+                     action: #selector(revealInFinder), keyEquivalent: "")
+
         menu.addItem(withTitle: "Open in Editor",
                      action: #selector(openInEditor), keyEquivalent: "")
 
-        menu.addItem(withTitle: "Reload",
-                     action: #selector(reloadDocument), keyEquivalent: "")
+        menu.addItem(.separator())
+
+        menu.addItem(withTitle: "Copy Document Text",
+                     action: #selector(copyDocumentText), keyEquivalent: "")
     }
 
     @objc private func copyDocumentText() {
         NotificationCenter.default.post(name: .glanceCopyText, object: nil)
     }
 
-    @objc private func setFont(_ sender: NSMenuItem) {
-        guard let key = sender.representedObject as? String else { return }
-        UserDefaults.standard.set(key, forKey: "fontFamily")
+    @objc private func copyPath() {
+        NotificationCenter.default.post(name: .glanceCopyPath, object: nil)
     }
 
-    @objc private func setTheme(_ sender: NSMenuItem) {
-        guard let key = sender.representedObject as? String else { return }
-        UserDefaults.standard.set(key, forKey: "theme")
+    @objc private func revealInFinder() {
+        NotificationCenter.default.post(name: .glanceRevealInFinder, object: nil)
     }
 
     @objc private func openInEditor() {
         NotificationCenter.default.post(name: .glanceOpenInEditor, object: nil)
-    }
-
-    @objc private func reloadDocument() {
-        NotificationCenter.default.post(name: .glanceReload, object: nil)
     }
 
     @objc private func toggleKeepOnTop() {
@@ -182,6 +162,7 @@ struct WebView: NSViewRepresentable {
         let userContentController = WKUserContentController()
         userContentController.add(context.coordinator, name: Coordinator.linkBridgeName)
         userContentController.add(context.coordinator, name: Coordinator.openInWindowName)
+        userContentController.add(context.coordinator, name: Coordinator.actionName)
         let bridgeScript = WKUserScript(
             source: Self.linkBridgeJS,
             injectionTime: .atDocumentEnd,
@@ -251,10 +232,14 @@ struct WebView: NSViewRepresentable {
         var raw = link.getAttribute('href');
         if (!raw) return;
         if (raw.charAt(0) === '#') return;
-        var resolved = link.href;
-        if (!resolved) return;
         e.preventDefault();
         try {
+            if (link.classList.contains('glance-action')) {
+                window.webkit.messageHandlers.glanceAction.postMessage(raw);
+                return;
+            }
+            var resolved = link.href;
+            if (!resolved) return;
             if (link.classList.contains('glance-open')) {
                 window.webkit.messageHandlers.glanceOpen.postMessage(resolved);
             } else {
@@ -330,6 +315,7 @@ struct WebView: NSViewRepresentable {
     final class Coordinator: NSObject, WKNavigationDelegate, WKScriptMessageHandler {
         static let linkBridgeName = "glanceLink"
         static let openInWindowName = "glanceOpen"
+        static let actionName = "glanceAction"
 
         weak var webView: WKWebView?
         var lastHTML: String?
@@ -346,8 +332,23 @@ struct WebView: NSViewRepresentable {
 
         func userContentController(_ userContentController: WKUserContentController,
                                    didReceive message: WKScriptMessage) {
-            guard let urlString = message.body as? String,
-                  let url = URL(string: urlString) else { return }
+            guard let body = message.body as? String else { return }
+
+            if message.name == Self.actionName {
+                // Welcome-page buttons (class="glance-action") post their href
+                // verbatim; route known action names to notifications.
+                DispatchQueue.main.async {
+                    switch body {
+                    case "open":
+                        NotificationCenter.default.post(name: .glanceOpenPanel, object: nil)
+                    default:
+                        break
+                    }
+                }
+                return
+            }
+
+            guard let url = URL(string: body) else { return }
             switch message.name {
             case Self.linkBridgeName:
                 // External link → user's default app via LaunchServices.

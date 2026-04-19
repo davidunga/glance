@@ -1,44 +1,18 @@
 #!/usr/bin/env swift
-// Canonical icon generator for Glance.app. Produces a Mac-style squircle
-// page with three text bars and a thin border in the same colour as the
-// bars. Alternate variants (beam, clean, bordered) live alongside this
-// file as separate scripts.
+// Alternate icon generator: same page + text bars as make_icon.swift, but
+// WITHOUT the diagonal warm-yellow light beam. Writes a preview PNG plus
+// a full .iconset so the result can be compared before promotion.
 //
-// Usage: swift tools/make_icon.swift [output.iconset]
+// Usage: swift tools/make_icon_clean.swift
 
 import AppKit
 import Foundation
 
-let outDir = CommandLine.arguments.dropFirst().first.map(URL.init(fileURLWithPath:))
-    ?? URL(fileURLWithPath: "glance.iconset")
+let outDir = URL(fileURLWithPath: "AppIcon-clean.iconset")
+let previewURL = URL(fileURLWithPath: "AppIcon-clean-preview.png")
 
 try? FileManager.default.removeItem(at: outDir)
 try FileManager.default.createDirectory(at: outDir, withIntermediateDirectories: true)
-
-/// Superellipse with exponent ≈ 5 — visually indistinguishable from Apple's
-/// iOS/macOS icon squircle. Sampled as a fine polyline (~720 segments) so
-/// even thick strokes render without visible facets.
-func squirclePath(in rect: CGRect, exponent n: CGFloat = 5, steps: Int = 720) -> NSBezierPath {
-    let path = NSBezierPath()
-    let cx = rect.midX
-    let cy = rect.midY
-    let rx = rect.width / 2
-    let ry = rect.height / 2
-    for i in 0...steps {
-        let t = CGFloat(i) / CGFloat(steps) * 2 * .pi
-        let cosT = cos(t)
-        let sinT = sin(t)
-        let x = cx + rx * copysign(pow(abs(cosT), 2 / n), cosT)
-        let y = cy + ry * copysign(pow(abs(sinT), 2 / n), sinT)
-        if i == 0 {
-            path.move(to: CGPoint(x: x, y: y))
-        } else {
-            path.line(to: CGPoint(x: x, y: y))
-        }
-    }
-    path.close()
-    return path
-}
 
 func render(size px: Int) -> Data {
     let s = CGFloat(px)
@@ -66,11 +40,13 @@ func render(size px: Int) -> Data {
 
     let ctx = nsCtx.cgContext
     let cs = CGColorSpaceCreateDeviceRGB()
-    let fullRect = CGRect(x: 0, y: 0, width: s, height: s)
 
-    NSGraphicsContext.current?.saveGraphicsState()
-    squirclePath(in: fullRect).addClip()
+    let radius = s * 0.2237
+    NSBezierPath(roundedRect: CGRect(x: 0, y: 0, width: s, height: s),
+                 xRadius: radius, yRadius: radius).addClip()
 
+    // Paper gradient — slightly deeper bottom tone than the original so the
+    // icon doesn't look flat after the beam is removed.
     let paper = CGGradient(
         colorsSpace: cs,
         colors: [
@@ -86,6 +62,7 @@ func render(size px: Int) -> Data {
         options: []
     )
 
+    // Three text bars — same geometry as the original.
     let barColor = NSColor(red: 0.62, green: 0.64, blue: 0.69, alpha: 1.0)
     let barInsetX = s * 0.17
     let barAreaWidth = s - barInsetX * 2
@@ -104,15 +81,17 @@ func render(size px: Int) -> Data {
         path.fill()
     }
 
-    NSGraphicsContext.current?.restoreGraphicsState()
-
-    // Thin border in bar colour, stroked flush with the squircle edge.
-    let strokeWidth = max(1, s * 0.012)
-    let inset = strokeWidth / 2
-    let strokePath = squirclePath(in: fullRect.insetBy(dx: inset, dy: inset))
-    strokePath.lineWidth = strokeWidth
-    strokePath.lineJoinStyle = .round
-    barColor.setStroke()
+    // No beam. Add a very subtle 1px inner edge so the white page has a
+    // tiny bit of definition against light desktops.
+    ctx.setStrokeColor(CGColor(red: 0, green: 0, blue: 0, alpha: 0.04))
+    ctx.setLineWidth(max(1, s * 0.004))
+    let strokeInset = max(0.5, s * 0.002)
+    let strokePath = NSBezierPath(
+        roundedRect: CGRect(x: strokeInset, y: strokeInset,
+                            width: s - strokeInset * 2, height: s - strokeInset * 2),
+        xRadius: radius - strokeInset,
+        yRadius: radius - strokeInset
+    )
     strokePath.stroke()
 
     guard let png = rep.representation(using: .png, properties: [:]) else {
@@ -137,6 +116,10 @@ let entries: [(name: String, px: Int)] = [
 for entry in entries {
     let data = render(size: entry.px)
     try data.write(to: outDir.appendingPathComponent(entry.name))
-    print("  \(entry.name)  (\(entry.px)×\(entry.px))")
 }
-print("✓ wrote \(entries.count) icon sizes to \(outDir.path)")
+
+// Big preview image for side-by-side comparison.
+try render(size: 1024).write(to: previewURL)
+
+print("✓ wrote iconset to \(outDir.path)")
+print("✓ wrote preview to \(previewURL.path)")

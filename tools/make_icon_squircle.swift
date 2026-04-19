@@ -1,23 +1,22 @@
 #!/usr/bin/env swift
-// Canonical icon generator for Glance.app. Produces a Mac-style squircle
-// page with three text bars and a thin border in the same colour as the
-// bars. Alternate variants (beam, clean, bordered) live alongside this
-// file as separate scripts.
+// Squircle variant — same design as make_icon_bordered.swift but with an
+// Apple-style superellipse ("squircle") outline instead of circular rounded
+// corners. This matches the shape of stock macOS app icons.
 //
-// Usage: swift tools/make_icon.swift [output.iconset]
+// Usage: swift tools/make_icon_squircle.swift
 
 import AppKit
 import Foundation
 
-let outDir = CommandLine.arguments.dropFirst().first.map(URL.init(fileURLWithPath:))
-    ?? URL(fileURLWithPath: "glance.iconset")
+let outDir = URL(fileURLWithPath: "AppIcon-squircle.iconset")
+let previewURL = URL(fileURLWithPath: "AppIcon-squircle-preview.png")
 
 try? FileManager.default.removeItem(at: outDir)
 try FileManager.default.createDirectory(at: outDir, withIntermediateDirectories: true)
 
 /// Superellipse with exponent ≈ 5 — visually indistinguishable from Apple's
-/// iOS/macOS icon squircle. Sampled as a fine polyline (~720 segments) so
-/// even thick strokes render without visible facets.
+/// iOS/macOS icon squircle. Sampled as a fine polyline (~720 segments at
+/// 1024px) so even thick strokes render without visible facets.
 func squirclePath(in rect: CGRect, exponent n: CGFloat = 5, steps: Int = 720) -> NSBezierPath {
     let path = NSBezierPath()
     let cx = rect.midX
@@ -106,7 +105,7 @@ func render(size px: Int) -> Data {
 
     NSGraphicsContext.current?.restoreGraphicsState()
 
-    // Thin border in bar colour, stroked flush with the squircle edge.
+    // Thin border in bar color, stroked along the squircle edge.
     let strokeWidth = max(1, s * 0.012)
     let inset = strokeWidth / 2
     let strokePath = squirclePath(in: fullRect.insetBy(dx: inset, dy: inset))
@@ -137,6 +136,9 @@ let entries: [(name: String, px: Int)] = [
 for entry in entries {
     let data = render(size: entry.px)
     try data.write(to: outDir.appendingPathComponent(entry.name))
-    print("  \(entry.name)  (\(entry.px)×\(entry.px))")
 }
-print("✓ wrote \(entries.count) icon sizes to \(outDir.path)")
+
+try render(size: 1024).write(to: previewURL)
+
+print("✓ wrote iconset to \(outDir.path)")
+print("✓ wrote preview to \(previewURL.path)")

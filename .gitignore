@@ -3,6 +3,9 @@
 Glance.app/
 glance.iconset/
 AppIcon.icns
+AppIcon-*.icns
+AppIcon-*.iconset/
+AppIcon-*-preview.png
 
 # Highlight.js assets fetched by build.sh
 Sources/glance/Resources/highlight.min.js

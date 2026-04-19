@@ -113,6 +113,21 @@ struct ContentView: View {
         .onReceive(NotificationCenter.default.publisher(for: .glanceOpenInEditor)) { _ in
             document.openInEditor()
         }
+        .onReceive(NotificationCenter.default.publisher(for: .glanceCopyPath)) { _ in
+            document.copyPath()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .glanceRevealInFinder)) { _ in
+            document.revealInFinder()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .glanceOpenPanel)) { _ in
+            guard let url = MarkdownDocument.showOpenPanel() else { return }
+            let canonical = url.standardizedFileURL
+            if WindowManager.shared.focusExistingWindow(for: canonical) {
+                closeIfEmpty()
+            } else {
+                document.load(canonical)
+            }
+        }
     }
 
     /// Closes this window if its document is empty (no file loaded). Used
