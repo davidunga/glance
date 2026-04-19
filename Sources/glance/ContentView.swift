@@ -75,12 +75,18 @@ struct ContentView: View {
             didInitializeOnce = true
             if let url = AppDelegate.popPendingURL() {
                 DispatchQueue.main.async { handleIncomingURL(url) }
-            } else {
+            } else if AppDelegate.hasLaunched {
                 document.resetToWelcome()
             }
+            // else: cold launch, no URL yet — application(_:open:) may still
+            // fire. Wait for .glanceLaunchComplete before deciding.
         }
         .onReceive(NotificationCenter.default.publisher(for: .glanceURLsQueued)) { _ in
             drainQueuedURLs()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .glanceLaunchComplete)) { _ in
+            guard document.currentURL == nil else { return }
+            document.resetToWelcome()
         }
         .onDrop(of: [.fileURL], isTargeted: nil) { providers in
             guard let provider = providers.first else { return false }

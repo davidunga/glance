@@ -26,25 +26,18 @@ extension Notification.Name {
     /// URLs arrive while the app is already running. Listening views drain
     /// `AppDelegate.pendingURLs` and spawn new document windows accordingly.
     static let glanceURLsQueued = Notification.Name("glance.urlsQueued")
+
+    /// Posted once by `applicationDidFinishLaunching`. At this point all
+    /// cold-launch Apple Events (kAEOpenDocuments) have already been
+    /// dispatched, so `pendingURLs` is fully populated and every existing
+    /// window knows whether it received a file. Windows that are still empty
+    /// show the welcome page in response to this notification.
+    static let glanceLaunchComplete = Notification.Name("glance.launchComplete")
 }
 
 // MARK: - App delegate
 
-/// Responsibilities:
-/// 1. Quit the app when the last window closes. Glance is a document viewer
-///    with a landing page — when every window is gone, there's nothing to
-///    return to, so keeping a headless process alive is just confusing.
-/// 2. Disable macOS state restoration. A fresh launch should always show the
-///    welcome page, never the previous session's files (and never silently
-///    re-open files that may have moved or been deleted since).
-/// 3. Intercept incoming file URLs (from Finder double-click, `open`, CLI
-///    args, drag-onto-dock) BEFORE SwiftUI creates its initial window. The
-///    URLs sit in `pendingURLs`; each new window's onAppear pops one. This
-///    is the mechanism that keeps the welcome page from flashing ahead of
-///    the file — a launch-with-file never renders welcome because the first
-///    window's onAppear already finds a URL queued.
-final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
-    @Published var needsWelcomeWindow = false
+final class AppDelegate: NSObject, NSApplicationDelegate {
     /// FIFO queue of file URLs waiting to be absorbed by a document window.
     /// Populated by `applicationWillFinishLaunching` (CLI args) and
     /// `application(_:open:)` (Finder / Apple Events). Drained by
@@ -52,22 +45,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
     /// handler. Main-queue-only — no locking needed.
     static var pendingURLs: [URL] = []
 
+    /// Set to true once `applicationDidFinishLaunching` completes. Windows
+    /// that appear after this point (Cmd+N, drag-open, etc.) know they're
+    /// warm-app opens and should show welcome immediately if they have no file.
+    static var hasLaunched = false
+
     func applicationWillFinishLaunching(_ notification: Notification) {
-        // Bypass the "reopen windows on next launch" behavior baked into
-        // NSApplication. Both keys exist for historical reasons — the first is
-        // what the System Settings checkbox writes, the second is what
-        // NSUserDefaults reads on older macOS revisions.
         UserDefaults.standard.set(false, forKey: "NSQuitAlwaysKeepsWindows")
         UserDefaults.standard.set(true,  forKey: "ApplePersistenceIgnoreState")
 
-        // Harvest any file paths passed on the command line (`glance file.md`).
-        // This runs before SwiftUI builds the first window, so the initial
-        // `ContentView.onAppear` will find the URL already queued and load it
-        // directly without showing welcome first.
-        //
-        // Skip anything that looks like a flag — AppKit / Xcode sometimes inject
-        // args like `-NSDocumentRevisionsDebugMode YES`, and `--render` (CLI
-        // print mode) was already handled in GlanceApp.init before we got here.
         for arg in CommandLine.arguments.dropFirst() {
             guard !arg.hasPrefix("-") else { continue }
             let url = URL(fileURLWithPath: arg)
@@ -76,59 +62,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
         }
     }
 
-    /// Called by AppKit for every incoming file URL — double-click in Finder,
-    /// `open file.md` from Terminal, drag onto Dock icon, "Open With" menu,
-    /// kAEOpenDocuments Apple Events. On cold launch this may fire before OR
-    /// after the first SwiftUI window is built. Queuing URLs here + listening
-    /// for `.glanceURLsQueued` in views handles both orderings.
-    /// AppKit's default path for kAEOpenDocuments during cold launch —
-    /// invoked once before we install our own handler in
-    /// `applicationDidFinishLaunching`. Warm-app file opens go through
-    /// `handleOpenDocumentsEvent(_:withReplyEvent:)` instead.
+    /// Cold-launch file open. Fires (via AppKit's default kAEOpenDocuments
+    /// handler) BEFORE `applicationDidFinishLaunching`, so by the time we
+    /// post `.glanceLaunchComplete`, the URL is already in `pendingURLs` and
+    /// the window knows it should load a file rather than show welcome.
     func application(_ application: NSApplication, open urls: [URL]) {
         let canonical = urls.map { $0.standardizedFileURL }
         AppDelegate.pendingURLs.append(contentsOf: canonical)
         NotificationCenter.default.post(name: .glanceURLsQueued, object: nil)
     }
 
-    /// Prevent SwiftUI from auto-creating an untitled window on launch. We
-    /// control all window creation ourselves: files get windows via the
-    /// standard URL queue mechanism; no-file launches get a welcome window
-    /// from `applicationDidFinishLaunching` via `needsWelcomeWindow`.
-    func applicationShouldOpenUntitledFile(_ sender: NSApplication) -> Bool {
-        return false
-    }
-
     func applicationDidFinishLaunching(_ notification: Notification) {
-        // If no files were queued before launch finished (no Finder open, no
-        // CLI args, no kAEOpenDocuments), show the welcome page. This mirrors
-        // how Preview.app works: suppress untitled-file creation, then
-        // explicitly open the landing window only when nothing else did.
-        if AppDelegate.pendingURLs.isEmpty {
-            needsWelcomeWindow = true
-        }
 
-        // Claim kAEOpenDocuments ONLY after launch finishes. On cold launch
-        // with a file (`open -a Glance file.md`), AppKit dispatches this
-        // event BEFORE `applicationDidFinishLaunching` so the default handler
-        // still runs — that's what lets SwiftUI spawn the initial window
-        // carrying the file. By the time we're here, the initial window is
-        // up and we can safely take over: any subsequent file opens
-        // (warm-app) go through our handler, which enqueues and posts
-        // `.glanceURLsQueued` without triggering SwiftUI's auto-spawn.
+        // Register warm-app kAEOpenDocuments handler. Cold-launch file opens
+        // already went through AppKit's default handler (above), so we only
+        // take over from here for subsequent opens.
         NSAppleEventManager.shared().setEventHandler(
             self,
             andSelector: #selector(handleOpenDocumentsEvent(_:withReplyEvent:)),
             forEventClass: AEEventClass(kCoreEventClass),
             andEventID: AEEventID(kAEOpenDocuments)
         )
+
+        AppDelegate.hasLaunched = true
+        // All cold-launch Apple Events have now been processed. Any window
+        // that is still empty should show the welcome page.
+        NotificationCenter.default.post(name: .glanceLaunchComplete, object: nil)
     }
 
-    /// Warm-app replacement for AppKit's default kAEOpenDocuments handler.
-    /// Parses the file-URL list out of the event, queues the URLs, and fires
-    /// the drain notification for existing windows. Because this handler is
-    /// only installed AFTER the initial window is up, cold-launch-with-file
-    /// continues to work via AppKit's own behaviour.
+    /// Warm-app kAEOpenDocuments handler (installed after first launch).
     @objc func handleOpenDocumentsEvent(_ event: NSAppleEventDescriptor,
                                         withReplyEvent replyEvent: NSAppleEventDescriptor) {
         guard let listDesc = event.paramDescriptor(forKeyword: AEKeyword(keyDirectObject)) else {
@@ -148,7 +110,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
             urls.append(url.standardizedFileURL)
         }
         guard !urls.isEmpty else { return }
-
         AppDelegate.pendingURLs.append(contentsOf: urls)
         NotificationCenter.default.post(name: .glanceURLsQueued, object: nil)
     }
@@ -166,7 +127,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
 @main
 struct GlanceApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
-    @Environment(\.openWindow) private var openWindow
 
     init() {
         // CLI mode: `glance --render file.md` prints rendered HTML and exits.
@@ -196,11 +156,6 @@ struct GlanceApp: App {
                         fontFamily: fontFamily,
                         themeOverride: theme.colorScheme)
                 .preferredColorScheme(theme.colorScheme)
-        }
-        .onChange(of: appDelegate.needsWelcomeWindow) { needs in
-            guard needs else { return }
-            openWindow(value: UUID())
-            appDelegate.needsWelcomeWindow = false
         }
         .windowToolbarStyle(.unifiedCompact)
         .commands {
