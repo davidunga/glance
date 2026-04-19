@@ -73,6 +73,26 @@ struct ContentView: View {
                         document.load(url)
                     }
                 }
+            } else {
+                // No pending URL. This could be:
+                //   (a) Cold launch with a file — `onOpenURL` is about to
+                //       fire with the file URL.
+                //   (b) Cold / dock-click launch with no file — welcome page.
+                //   (c) A warm-app file-open that spun up a new window —
+                //       `onOpenURL` fires shortly after.
+                //
+                // The document was initialized with blank html precisely so
+                // (a) and (c) don't flash the welcome page before the file
+                // loads. Wait a short grace period; if no URL has arrived by
+                // then, render welcome. `showWelcomeIfEmpty` no-ops if the
+                // document is already populated.
+                //
+                // CMD+N sets `showWelcomeOnNext`, so welcome is rendered
+                // directly in `init()` — the delay here is a harmless no-op
+                // in that path (guard on `html.isEmpty`).
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+                    document.showWelcomeIfEmpty()
+                }
             }
         }
         .onOpenURL { url in

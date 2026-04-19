@@ -75,6 +75,16 @@ final class GlanceWebView: WKWebView {
 
         menu.addItem(.separator())
 
+        // Keep-on-top toggle. Reflects the current window level with a
+        // checkmark; the action flips it.
+        let keepOnTop = NSMenuItem(title: "Keep on Top",
+                                   action: #selector(toggleKeepOnTop),
+                                   keyEquivalent: "")
+        keepOnTop.state = (window?.level == .floating) ? .on : .off
+        menu.addItem(keepOnTop)
+
+        menu.addItem(.separator())
+
         menu.addItem(withTitle: "Open in Editor",
                      action: #selector(openInEditor), keyEquivalent: "")
 
@@ -102,6 +112,15 @@ final class GlanceWebView: WKWebView {
 
     @objc private func reloadDocument() {
         NotificationCenter.default.post(name: .glanceReload, object: nil)
+    }
+
+    @objc private func toggleKeepOnTop() {
+        guard let window else { return }
+        // `.floating` pins the window above regular app windows; `.normal` is
+        // the default. We flip between just these two — other levels
+        // (statusBar, modalPanel, …) would change stacking behavior in ways
+        // users wouldn't expect from a "keep on top" toggle.
+        window.level = (window.level == .floating) ? .normal : .floating
     }
 
     // MARK: - Appearance

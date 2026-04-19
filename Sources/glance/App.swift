@@ -135,7 +135,13 @@ struct GlanceCommands: Commands {
             // CMD+N opens a fresh welcome window. CMD+O opens a file (focusing
             // an existing window if that file is already open). Shift+CMD+N
             // navigates the current window back to the welcome page.
-            Button("New Window") { openWindow(value: UUID()) }
+            Button("New Window") {
+                // We know this spawn is for the welcome page — no file is
+                // coming — so bypass the grace-period blank state by flipping
+                // the escape hatch before asking SwiftUI to create the window.
+                MarkdownDocument.showWelcomeOnNext = true
+                openWindow(value: UUID())
+            }
                 .keyboardShortcut("n", modifiers: .command)
 
             Button("Open…") {
@@ -354,8 +360,28 @@ final class MarkdownDocument: ObservableObject {
     private var pollTimer: Timer?
     private var lastModified: Date?
 
+    /// Set to `true` immediately before a `CMD+N` spawn so the freshly-created
+    /// document renders the welcome page without a grace-period delay. All
+    /// other spawns (file-open via Finder / URL routing / CMD+O with a pending
+    /// URL) start blank and either load their file immediately or fall back
+    /// to welcome via `showWelcomeIfEmpty` after a short grace period.
+    static var showWelcomeOnNext = false
+
     init() {
-        self.html = MarkdownDocument.recentsWelcomeHTML()
+        // Blank by default. ContentView schedules a delayed
+        // `showWelcomeIfEmpty` in `onAppear`, which gives any incoming file
+        // URL (via `onOpenURL` or `pendingURL`) a chance to load first so the
+        // user never sees a welcome-page flash when launching with a file.
+        //
+        // The `showWelcomeOnNext` escape hatch short-circuits that grace
+        // period for cases where we know up front there's no file coming
+        // (explicit "New Window" from the menu).
+        if MarkdownDocument.showWelcomeOnNext {
+            MarkdownDocument.showWelcomeOnNext = false
+            self.html = MarkdownDocument.recentsWelcomeHTML()
+        } else {
+            self.html = ""
+        }
     }
 
     /// Shows an NSOpenPanel and returns the selected URL, or nil if cancelled.
@@ -393,6 +419,17 @@ final class MarkdownDocument: ObservableObject {
         WindowManager.shared.updateURL(url, for: self)
         reload()
         watch(url)
+    }
+
+    /// Called by `ContentView.onAppear` after a short grace period. If nothing
+    /// has populated this document yet (no file loaded, html still empty),
+    /// render the welcome page. The guard keeps this a no-op when a file URL
+    /// arrived via `onOpenURL` in the meantime — which is exactly the case
+    /// that earns the whole grace-period dance (launch-with-file should not
+    /// flash the welcome page before the file loads).
+    func showWelcomeIfEmpty() {
+        guard currentURL == nil, html.isEmpty else { return }
+        html = MarkdownDocument.recentsWelcomeHTML()
     }
 
     /// Shift+Cmd+N: navigate this window back to the welcome page. Stops the
