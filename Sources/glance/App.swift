@@ -21,16 +21,45 @@ enum Theme: String, CaseIterable, Identifiable {
     }
 }
 
+extension Notification.Name {
+    /// Posted by `AppDelegate.application(_:open:)` when one or more file
+    /// URLs arrive while the app is already running. Listening views drain
+    /// `AppDelegate.pendingURLs` and spawn new document windows accordingly.
+    static let glanceURLsQueued = Notification.Name("glance.urlsQueued")
+}
+
 // MARK: - App delegate
 
-/// Two responsibilities:
+/// Responsibilities:
 /// 1. Quit the app when the last window closes. Glance is a document viewer
 ///    with a landing page — when every window is gone, there's nothing to
 ///    return to, so keeping a headless process alive is just confusing.
 /// 2. Disable macOS state restoration. A fresh launch should always show the
 ///    welcome page, never the previous session's files (and never silently
 ///    re-open files that may have moved or been deleted since).
+/// 3. Intercept incoming file URLs (from Finder double-click, `open`, CLI
+///    args, drag-onto-dock) BEFORE SwiftUI creates its initial window. The
+///    URLs sit in `pendingURLs`; each new window's onAppear pops one. This
+///    is the mechanism that keeps the welcome page from flashing ahead of
+///    the file — a launch-with-file never renders welcome because the first
+///    window's onAppear already finds a URL queued.
 final class AppDelegate: NSObject, NSApplicationDelegate {
+    /// FIFO queue of file URLs waiting to be absorbed by a document window.
+    /// Populated by `applicationWillFinishLaunching` (CLI args) and
+    /// `application(_:open:)` (Finder / Apple Events). Drained by
+    /// `ContentView.onAppear` and the `.glanceURLsQueued` notification
+    /// handler. Main-queue-only — no locking needed.
+    static var pendingURLs: [URL] = []
+
+    /// Timestamp of the most recent external file-open event. The
+    /// `.glanceURLsQueued` observer compares this against `lastConsumedEvent`
+    /// so only the FIRST window to react to a notification drains the queue
+    /// — without this guard, N open windows would each try to drain the same
+    /// batch and spawn N copies of every file.
+    static var lastOpenEventTime: Date?
+    static var lastConsumedEventTime: Date?
+
+
     func applicationWillFinishLaunching(_ notification: Notification) {
         // Bypass the "reopen windows on next launch" behavior baked into
         // NSApplication. Both keys exist for historical reasons — the first is
@@ -38,10 +67,94 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // NSUserDefaults reads on older macOS revisions.
         UserDefaults.standard.set(false, forKey: "NSQuitAlwaysKeepsWindows")
         UserDefaults.standard.set(true,  forKey: "ApplePersistenceIgnoreState")
+
+        // Harvest any file paths passed on the command line (`glance file.md`).
+        // This runs before SwiftUI builds the first window, so the initial
+        // `ContentView.onAppear` will find the URL already queued and load it
+        // directly without showing welcome first.
+        //
+        // Skip anything that looks like a flag — AppKit / Xcode sometimes inject
+        // args like `-NSDocumentRevisionsDebugMode YES`, and `--render` (CLI
+        // print mode) was already handled in GlanceApp.init before we got here.
+        for arg in CommandLine.arguments.dropFirst() {
+            guard !arg.hasPrefix("-") else { continue }
+            let url = URL(fileURLWithPath: arg)
+            guard FileManager.default.fileExists(atPath: url.path) else { continue }
+            AppDelegate.pendingURLs.append(url.standardizedFileURL)
+            AppDelegate.lastOpenEventTime = Date()
+        }
+    }
+
+    /// Called by AppKit for every incoming file URL — double-click in Finder,
+    /// `open file.md` from Terminal, drag onto Dock icon, "Open With" menu,
+    /// kAEOpenDocuments Apple Events. On cold launch this may fire before OR
+    /// after the first SwiftUI window is built. Queuing URLs here + listening
+    /// for `.glanceURLsQueued` in views handles both orderings.
+    /// AppKit's default path for kAEOpenDocuments during cold launch —
+    /// invoked once before we install our own handler in
+    /// `applicationDidFinishLaunching`. Warm-app file opens go through
+    /// `handleOpenDocumentsEvent(_:withReplyEvent:)` instead.
+    func application(_ application: NSApplication, open urls: [URL]) {
+        let canonical = urls.map { $0.standardizedFileURL }
+        AppDelegate.pendingURLs.append(contentsOf: canonical)
+        AppDelegate.lastOpenEventTime = Date()
+        NotificationCenter.default.post(name: .glanceURLsQueued, object: nil)
+    }
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        // Claim kAEOpenDocuments ONLY after launch finishes. On cold launch
+        // with a file (`open -a Glance file.md`), AppKit dispatches this
+        // event BEFORE `applicationDidFinishLaunching` so the default handler
+        // still runs — that's what lets SwiftUI spawn the initial window
+        // carrying the file. By the time we're here, the initial window is
+        // up and we can safely take over: any subsequent file opens
+        // (warm-app) go through our handler, which enqueues and posts
+        // `.glanceURLsQueued` without triggering SwiftUI's auto-spawn.
+        NSAppleEventManager.shared().setEventHandler(
+            self,
+            andSelector: #selector(handleOpenDocumentsEvent(_:withReplyEvent:)),
+            forEventClass: AEEventClass(kCoreEventClass),
+            andEventID: AEEventID(kAEOpenDocuments)
+        )
+    }
+
+    /// Warm-app replacement for AppKit's default kAEOpenDocuments handler.
+    /// Parses the file-URL list out of the event, queues the URLs, and fires
+    /// the drain notification for existing windows. Because this handler is
+    /// only installed AFTER the initial window is up, cold-launch-with-file
+    /// continues to work via AppKit's own behaviour.
+    @objc func handleOpenDocumentsEvent(_ event: NSAppleEventDescriptor,
+                                        withReplyEvent replyEvent: NSAppleEventDescriptor) {
+        guard let listDesc = event.paramDescriptor(forKeyword: AEKeyword(keyDirectObject)) else {
+            return
+        }
+        var urls: [URL] = []
+        let count = listDesc.numberOfItems
+        guard count > 0 else { return }
+        for i in 1...count {
+            guard let itemDesc = listDesc.atIndex(i) else { continue }
+            guard let urlDesc = itemDesc.coerce(toDescriptorType: DescType(typeFileURL)) else {
+                continue
+            }
+            let data = urlDesc.data
+            guard let urlStr = String(data: data, encoding: .utf8),
+                  let url = URL(string: urlStr) else { continue }
+            urls.append(url.standardizedFileURL)
+        }
+        guard !urls.isEmpty else { return }
+
+        AppDelegate.pendingURLs.append(contentsOf: urls)
+        AppDelegate.lastOpenEventTime = Date()
+        NotificationCenter.default.post(name: .glanceURLsQueued, object: nil)
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         true
+    }
+
+    /// Pops the next queued URL, or returns nil if the queue is empty.
+    static func popPendingURL() -> URL? {
+        pendingURLs.isEmpty ? nil : pendingURLs.removeFirst()
     }
 }
 
@@ -136,10 +249,6 @@ struct GlanceCommands: Commands {
             // an existing window if that file is already open). Shift+CMD+N
             // navigates the current window back to the welcome page.
             Button("New Window") {
-                // We know this spawn is for the welcome page — no file is
-                // coming — so bypass the grace-period blank state by flipping
-                // the escape hatch before asking SwiftUI to create the window.
-                MarkdownDocument.showWelcomeOnNext = true
                 openWindow(value: UUID())
             }
                 .keyboardShortcut("n", modifiers: .command)
@@ -152,8 +261,9 @@ struct GlanceCommands: Commands {
                 if let doc = document {
                     doc.load(canonical)
                 } else {
-                    // No window at all — open a new one carrying the URL.
-                    MarkdownDocument.pendingURL = canonical
+                    // No window at all — queue the URL and spin up a new one.
+                    // The fresh window's onAppear pops the queue and loads it.
+                    AppDelegate.pendingURLs.append(canonical)
                     openWindow(value: UUID())
                 }
             }
@@ -335,6 +445,7 @@ final class WindowManager: ObservableObject {
         return NSApp.windows.first(where: { ObjectIdentifier($0) == wid })
     }
 
+
     // MARK: – Private
 
     private func windowWillClose(_ window: NSWindow) {
@@ -360,28 +471,23 @@ final class MarkdownDocument: ObservableObject {
     private var pollTimer: Timer?
     private var lastModified: Date?
 
-    /// Set to `true` immediately before a `CMD+N` spawn so the freshly-created
-    /// document renders the welcome page without a grace-period delay. All
-    /// other spawns (file-open via Finder / URL routing / CMD+O with a pending
-    /// URL) start blank and either load their file immediately or fall back
-    /// to welcome via `showWelcomeIfEmpty` after a short grace period.
-    static var showWelcomeOnNext = false
+    /// Weak reference to the NSWindow hosting this document, set by
+    /// `WindowAccessor` as soon as the view's NSView hierarchy has an
+    /// attached window. Needed for the orphan-close path — `WindowManager`'s
+    /// registration is deferred one run-loop hop, so a window spawned in
+    /// response to kAEOpenDocuments might not be in the manager's tables yet
+    /// when its onAppear decides to close itself. This pointer gives us a
+    /// fallback handle we can close directly.
+    weak var hostWindow: NSWindow?
 
     init() {
-        // Blank by default. ContentView schedules a delayed
-        // `showWelcomeIfEmpty` in `onAppear`, which gives any incoming file
-        // URL (via `onOpenURL` or `pendingURL`) a chance to load first so the
-        // user never sees a welcome-page flash when launching with a file.
-        //
-        // The `showWelcomeOnNext` escape hatch short-circuits that grace
-        // period for cases where we know up front there's no file coming
-        // (explicit "New Window" from the menu).
-        if MarkdownDocument.showWelcomeOnNext {
-            MarkdownDocument.showWelcomeOnNext = false
-            self.html = MarkdownDocument.recentsWelcomeHTML()
-        } else {
-            self.html = ""
-        }
+        // Blank by default. `ContentView.onAppear` runs synchronously on first
+        // layout and decides between "pop a queued URL" (load the file) and
+        // "show welcome". Because URLs are queued into `AppDelegate.pendingURLs`
+        // BEFORE any window exists (see `applicationWillFinishLaunching` and
+        // `application(_:open:)`), there's no race — a launch-with-file always
+        // finds a URL waiting and never renders welcome.
+        self.html = ""
     }
 
     /// Shows an NSOpenPanel and returns the selected URL, or nil if cancelled.
@@ -401,9 +507,6 @@ final class MarkdownDocument: ObservableObject {
         return panel.url
     }
 
-    /// URL to load when the next new window opens, set by CMD+O with no active window.
-    static var pendingURL: URL?
-
     func openPanel() {
         if let url = MarkdownDocument.showOpenPanel() {
             load(url)
@@ -421,12 +524,9 @@ final class MarkdownDocument: ObservableObject {
         watch(url)
     }
 
-    /// Called by `ContentView.onAppear` after a short grace period. If nothing
-    /// has populated this document yet (no file loaded, html still empty),
-    /// render the welcome page. The guard keeps this a no-op when a file URL
-    /// arrived via `onOpenURL` in the meantime — which is exactly the case
-    /// that earns the whole grace-period dance (launch-with-file should not
-    /// flash the welcome page before the file loads).
+    /// Called by `ContentView.onAppear` when no URL was queued for this
+    /// window. The `html.isEmpty` guard makes it a safe no-op if a file got
+    /// loaded in the meantime or onAppear is fired a second time.
     func showWelcomeIfEmpty() {
         guard currentURL == nil, html.isEmpty else { return }
         html = MarkdownDocument.recentsWelcomeHTML()

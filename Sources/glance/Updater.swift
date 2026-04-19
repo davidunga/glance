@@ -286,11 +286,19 @@ enum Updater {
 
     /// Writes a shell script that:
     ///  1. Waits (≤30s) for this process's PID to exit.
-    ///  2. Replaces `/Applications/Glance.app` with the newly unpacked bundle.
-    ///  3. Relaunches Glance via `open`.
+    ///  2. Strips `com.apple.quarantine` from the freshly-downloaded bundle
+    ///     — without this, Gatekeeper blocks the relaunch silently and the
+    ///     user sees a broken app after update.
+    ///  3. Replaces `/Applications/Glance.app` with the newly unpacked bundle.
+    ///  4. Clears xattrs on the installed copy too (belt-and-braces) and
+    ///     asserts the executable bit on the main binary (ditto should
+    ///     preserve it, but cross-filesystem or cross-user edge cases exist).
+    ///  5. Relaunches Glance via `open`.
     ///
     /// The script is spawned with its stdio detached from the parent, so when
     /// the app terminates the script continues and is reparented to launchd.
+    /// All output is tee'd to `install.log` next to the script for postmortem
+    /// diagnosis when something goes wrong.
     private static func launchInstaller(newAppPath: URL) throws {
         let scriptDir = try makeScratchDir()
         let scriptPath = scriptDir.appendingPathComponent("install.sh")
@@ -301,17 +309,40 @@ enum Updater {
 
         let script = """
         #!/bin/bash
+        # Log everything we do — invaluable when diagnosing a broken update.
+        exec >> "\(logPath.path)" 2>&1
+        echo "[$(date)] installer start (parent pid=\(pid))"
+
         # Wait for Glance (pid \(pid)) to exit — up to 30 seconds.
         for _ in $(seq 1 150); do
             if ! kill -0 \(pid) 2>/dev/null; then break; fi
             sleep 0.2
         done
-        # Replace the installed bundle. `ditto` preserves xattrs / code signing.
+        echo "[$(date)] parent exited or 30s timeout reached"
+
+        # Clear quarantine xattrs from the downloaded bundle BEFORE installing.
+        # URLSession marks downloaded files with com.apple.quarantine, which
+        # makes Gatekeeper refuse to launch the replacement app — the classic
+        # "update installs but app is broken after" failure mode.
+        /usr/bin/xattr -cr "\(newAppPath.path)" || true
+
+        # Replace the installed bundle. `ditto` preserves xattrs / code signing
+        # metadata — which is why we stripped quarantine on the source first.
         rm -rf "\(dest)"
         /usr/bin/ditto "\(newAppPath.path)" "\(dest)"
-        # Relaunch via LaunchServices so the new process starts outside our
-        # (now-dead) sandbox context.
+
+        # Belt-and-braces: strip xattrs on the installed copy too, and make
+        # sure the main executable is actually executable.
+        /usr/bin/xattr -cr "\(dest)" || true
+        /bin/chmod +x "\(dest)/Contents/MacOS/glance" || true
+
+        # Brief settle before relaunch — lets filesystem metadata flush and
+        # makes the sequence easier to reason about.
+        sleep 0.3
+
+        echo "[$(date)] install complete, relaunching"
         /usr/bin/open "\(dest)"
+        echo "[$(date)] open exit=$?"
         """
         try script.write(to: scriptPath, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes(
@@ -319,21 +350,19 @@ enum Updater {
             ofItemAtPath: scriptPath.path
         )
 
+        // Ensure the log file exists so the script's `exec >> logPath` has
+        // something to append to on the very first line.
+        FileManager.default.createFile(atPath: logPath.path, contents: nil)
+
         let task = Process()
         task.executableURL = URL(fileURLWithPath: "/bin/bash")
         task.arguments = [scriptPath.path]
-        // Detach stdio so the child doesn't die on SIGPIPE when our streams go
-        // away at termination. The log file is handy when something goes wrong
-        // — not strictly required for success.
-        FileManager.default.createFile(atPath: logPath.path, contents: nil)
-        if let logHandle = try? FileHandle(forWritingTo: logPath) {
-            task.standardOutput = logHandle
-            task.standardError = logHandle
-        } else {
-            task.standardOutput = FileHandle.nullDevice
-            task.standardError = FileHandle.nullDevice
-        }
+        // Detach stdio so the child doesn't die on SIGPIPE when our streams
+        // go away at termination. The script redirects its own stdio to the
+        // log file, so we just null the parent-side handles.
         task.standardInput = FileHandle.nullDevice
+        task.standardOutput = FileHandle.nullDevice
+        task.standardError = FileHandle.nullDevice
         try task.run()
         // Deliberately do NOT call waitUntilExit — we want the child to
         // outlive us.

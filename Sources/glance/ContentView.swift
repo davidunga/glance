@@ -15,6 +15,14 @@ struct ContentView: View {
     @StateObject private var document = MarkdownDocument()
     @StateObject private var find = FindController()
 
+    /// Ensures the one-shot initialization in `onAppear` runs at most once
+    /// per window, even if SwiftUI re-fires onAppear on view re-appearance.
+    /// Without this, a second onAppear could consume a URL from the pending
+    /// queue that was meant for a different (yet-to-be-created) window.
+    @State private var didInitializeOnce = false
+
+    @Environment(\.openWindow) private var openWindow
+
     var body: some View {
         ZStack(alignment: .topTrailing) {
             WebView(html: document.html,
@@ -52,67 +60,64 @@ struct ContentView: View {
         .focusedSceneValue(\.document, document)
         .focusedSceneValue(\.findController, find)
         .background(WindowAccessor { window in
-            // Register with WindowManager. Idempotent — safe to call on every
+            // Cache the window on the document IMMEDIATELY so orphan-close
+            // paths can find it even before `WindowManager.register` runs.
+            // `register` itself is idempotent — safe to call on every
             // SwiftUI update; only the first call per window does real work.
             // The manager pins tabbingMode = .disallowed and isRestorable =
             // false so each window stays standalone and fresh launches don't
             // resurrect the previous session.
+            document.hostWindow = window
             WindowManager.shared.register(window: window, document: document)
         })
         .onAppear {
-            // Consume a URL queued by CMD+O when no window was active.
-            // Also apply the uniqueness check: if the pending URL is already
-            // open in another window, focus that window and discard this
-            // freshly created host (it was opened solely to carry the URL).
-            if let url = MarkdownDocument.pendingURL {
-                MarkdownDocument.pendingURL = nil
+            // Per-window one-shot: decide whether this window loads a queued
+            // file URL or renders the welcome page.
+            //
+            // Timing on cold launch: `application(_:open:)` fires ~20-100ms
+            // AFTER this onAppear runs — the Apple Event is dispatched on a
+            // later runloop tick. We can't read it synchronously, so:
+            //   1. Try the queue now. Covers CLI args (harvested in
+            //      `applicationWillFinishLaunching`, which runs BEFORE any
+            //      window) and the CMD+O-with-no-window path (URL queued by
+            //      the command handler just before openWindow).
+            //   2. Otherwise defer welcome rendering behind two main-queue
+            //      hops so any pending kAEOpenDocuments event gets a chance
+            //      to dispatch first. If that event arrives, the
+            //      `.glanceURLsQueued` observer below loads the URL into this
+            //      (still-blank) window and welcome never renders.
+            //   3. If no URL shows up by the time we resume, render welcome.
+            //      `showWelcomeIfEmpty` no-ops if a file loaded in the
+            //      meantime (for example, a late warm-app drag onto the
+            //      still-empty window).
+            guard !didInitializeOnce else { return }
+            didInitializeOnce = true
+
+            if let url = AppDelegate.popPendingURL() {
+                DispatchQueue.main.async { handleIncomingURL(url) }
+                return
+            }
+
+            // Two main-queue hops before rendering welcome: lets any pending
+            // kAEOpenDocuments event (cold-launch only) dispatch first so the
+            // notification observer below can load the URL into this blank
+            // window. If no event arrives in the meantime, render welcome.
+            // `showWelcomeIfEmpty` is a no-op if html is already populated.
+            DispatchQueue.main.async {
                 DispatchQueue.main.async {
-                    if WindowManager.shared.focusExistingWindow(for: url.standardizedFileURL) {
-                        closeIfEmpty()
-                    } else {
-                        document.load(url)
-                    }
-                }
-            } else {
-                // No pending URL. This could be:
-                //   (a) Cold launch with a file — `onOpenURL` is about to
-                //       fire with the file URL.
-                //   (b) Cold / dock-click launch with no file — welcome page.
-                //   (c) A warm-app file-open that spun up a new window —
-                //       `onOpenURL` fires shortly after.
-                //
-                // The document was initialized with blank html precisely so
-                // (a) and (c) don't flash the welcome page before the file
-                // loads. Wait a short grace period; if no URL has arrived by
-                // then, render welcome. `showWelcomeIfEmpty` no-ops if the
-                // document is already populated.
-                //
-                // CMD+N sets `showWelcomeOnNext`, so welcome is rendered
-                // directly in `init()` — the delay here is a harmless no-op
-                // in that path (guard on `html.isEmpty`).
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
                     document.showWelcomeIfEmpty()
                 }
             }
         }
-        .onOpenURL { url in
-            // Defer to next runloop tick: synchronously mutating @Published
-            // state during initial scene setup races with SwiftUI's layout
-            // engine and triggers a RenderBox precondition failure.
-            //
-            // SwiftUI's typed WindowGroup auto-creates a fresh window when an
-            // external URL arrives, then routes the URL here. If the URL is
-            // already open in another window we focus that window AND close
-            // this newly-created empty host so the user doesn't end up with
-            // an orphan welcome page next to their document.
-            DispatchQueue.main.async {
-                let canonical = url.standardizedFileURL
-                if WindowManager.shared.focusExistingWindow(for: canonical) {
-                    closeIfEmpty()
-                } else {
-                    document.load(canonical)
-                }
-            }
+        .onReceive(NotificationCenter.default.publisher(for: .glanceURLsQueued)) { _ in
+            // Fires when URLs get queued via kAEOpenDocuments. Only ONE
+            // window must drain each batch, otherwise N open windows would
+            // each spawn a copy for every URL. Guard by timestamp: first
+            // responder claims the event, the rest bail out.
+            guard let evt = AppDelegate.lastOpenEventTime,
+                  evt != AppDelegate.lastConsumedEventTime else { return }
+            AppDelegate.lastConsumedEventTime = evt
+            drainQueuedURLs()
         }
         .onDrop(of: [.fileURL], isTargeted: nil) { providers in
             guard let provider = providers.first else { return false }
@@ -146,7 +151,53 @@ struct ContentView: View {
     /// auto-created host doesn't linger as an orphan welcome page.
     private func closeIfEmpty() {
         guard document.currentURL == nil else { return }
-        WindowManager.shared.window(for: document)?.close()
+        (document.hostWindow ?? WindowManager.shared.window(for: document))?.close()
+    }
+
+    /// Apply the standard uniqueness rule to an incoming URL: if it's already
+    /// open somewhere, focus that window and close this (otherwise empty)
+    /// host. Otherwise load the file into this window.
+    private func handleIncomingURL(_ url: URL) {
+        let canonical = url.standardizedFileURL
+        if WindowManager.shared.focusExistingWindow(for: canonical) {
+            closeIfEmpty()
+        } else {
+            document.load(canonical)
+        }
+    }
+
+    /// Drain the pending-URLs queue claimed by this window's notification
+    /// handler. For each URL:
+    ///   - If it's already open in another window → focus that window.
+    ///   - Else if this window is still blank (no file loaded yet; either
+    ///     empty right after launch or showing welcome) → load into this
+    ///     window. That's the path that eliminates the welcome-flash on
+    ///     cold-launch-with-file: the first window stays, and its content
+    ///     transitions from blank / welcome to the file.
+    ///   - Else → stash the URL back on the queue and call openWindow so a
+    ///     fresh host spawns and its onAppear pops the URL.
+    private func drainQueuedURLs() {
+        let urls = AppDelegate.pendingURLs
+        guard !urls.isEmpty else { return }
+        AppDelegate.pendingURLs.removeAll()
+
+        var spawnURLs: [URL] = []
+        var loadedIntoThisWindow = false
+        for url in urls {
+            if WindowManager.shared.focusExistingWindow(for: url) { continue }
+            if !loadedIntoThisWindow, document.currentURL == nil {
+                document.load(url)
+                loadedIntoThisWindow = true
+                continue
+            }
+            spawnURLs.append(url)
+        }
+
+        // Re-stash the overflow so each new window's onAppear can pop one.
+        AppDelegate.pendingURLs.append(contentsOf: spawnURLs)
+        for _ in spawnURLs {
+            openWindow(value: UUID())
+        }
     }
 }
 
@@ -268,18 +319,37 @@ private struct WindowAccessor: NSViewRepresentable {
     let configure: (NSWindow) -> Void
 
     func makeNSView(context: Context) -> NSView {
-        let view = NSView()
-        DispatchQueue.main.async {
-            if let window = view.window {
-                configure(window)
-            }
-        }
+        let view = NotifyingView(onMoveToWindow: configure)
         return view
     }
 
     func updateNSView(_ nsView: NSView, context: Context) {
         if let window = nsView.window {
             configure(window)
+        }
+    }
+}
+
+/// Custom NSView that fires `onMoveToWindow` as soon as it gets attached to
+/// an NSWindow. `viewDidMoveToWindow` runs SYNCHRONOUSLY on the main thread
+/// the moment AppKit wires the view into a window — earlier than any
+/// DispatchQueue.main.async-based approach can observe. That synchronous
+/// timing is what the orphan-close path depends on: it needs a usable
+/// `document.hostWindow` before `ContentView.onAppear` decides what to do.
+private final class NotifyingView: NSView {
+    let onMoveToWindow: (NSWindow) -> Void
+
+    init(onMoveToWindow: @escaping (NSWindow) -> Void) {
+        self.onMoveToWindow = onMoveToWindow
+        super.init(frame: .zero)
+    }
+
+    required init?(coder: NSCoder) { fatalError("unused") }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        if let window = self.window {
+            onMoveToWindow(window)
         }
     }
 }
