@@ -51,10 +51,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// handler. Main-queue-only — no locking needed.
     static var pendingURLs: [URL] = []
 
-    /// Set to true by the Cmd+N handler before calling openWindow so the
-    /// new window's onAppear shows the welcome page instead of closing.
-    static var openNextAsWelcome = false
-
     func applicationWillFinishLaunching(_ notification: Notification) {
         // Bypass the "reopen windows on next launch" behavior baked into
         // NSApplication. Both keys exist for historical reasons — the first is
@@ -241,7 +237,6 @@ struct GlanceCommands: Commands {
             // an existing window if that file is already open). Shift+CMD+N
             // navigates the current window back to the welcome page.
             Button("New Window") {
-                AppDelegate.openNextAsWelcome = true
                 openWindow(value: UUID())
             }
                 .keyboardShortcut("n", modifiers: .command)
@@ -489,13 +484,7 @@ final class MarkdownDocument: ObservableObject {
     weak var hostWindow: NSWindow?
 
     init() {
-        // Blank by default. `ContentView.onAppear` runs synchronously on first
-        // layout and decides between "pop a queued URL" (load the file) and
-        // "show welcome". Because URLs are queued into `AppDelegate.pendingURLs`
-        // BEFORE any window exists (see `applicationWillFinishLaunching` and
-        // `application(_:open:)`), there's no race — a launch-with-file always
-        // finds a URL waiting and never renders welcome.
-        self.html = ""
+        self.html = MarkdownDocument.recentsWelcomeHTML()
     }
 
     /// Shows an NSOpenPanel and returns the selected URL, or nil if cancelled.
