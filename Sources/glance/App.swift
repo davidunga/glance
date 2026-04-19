@@ -260,6 +260,17 @@ final class WindowManager: ObservableObject {
         ) { [weak self] note in
             guard let self, let w = note.object as? NSWindow else { return }
             self.keyWindowCanCreateTabs = self.isInMainGroup(w)
+            self.applyTabbingPolicy(to: w)
+        })
+        // didMove fires throughout (and at the end of) a window-drag — which
+        // is how a tab gets pulled out of a tab group. didBecomeKey is not
+        // enough on its own: when the user grabs a tab, that tab is already
+        // key, so detaching it never triggers another key-change notification.
+        observers.append(nc.addObserver(
+            forName: NSWindow.didMoveNotification, object: nil, queue: .main
+        ) { [weak self] note in
+            guard let self, let w = note.object as? NSWindow else { return }
+            self.applyTabbingPolicy(to: w)
         })
         observers.append(nc.addObserver(
             forName: NSWindow.willCloseNotification, object: nil, queue: .main
@@ -279,6 +290,11 @@ final class WindowManager: ObservableObject {
         guard !registered.contains(id) else { return }
         registered.insert(id)
 
+        // Make the window willing to participate in tabbing before we try to
+        // join the main group — explicitly .preferred so auto-tabbing kicks
+        // in regardless of the user's system preference.
+        window.tabbingMode = .preferred
+
         if mainWindow == nil {
             // Very first window — it becomes the permanent main host.
             mainWindow = window
@@ -289,6 +305,7 @@ final class WindowManager: ObservableObject {
             mainWindow?.addTabbedWindow(window, ordered: .above)
             window.makeKeyAndOrderFront(nil)
         }
+        applyTabbingPolicy(to: window)
     }
 
     /// Update the URL↔document mapping when a document loads a new file (or
@@ -310,18 +327,73 @@ final class WindowManager: ObservableObject {
         return main.tabGroup?.windows.contains(window) ?? false
     }
 
+    /// True if `window` exists outside the main tab group (i.e. the user
+    /// dragged its tab out into a free-standing window).
+    func isDetached(_ window: NSWindow) -> Bool {
+        mainWindow != nil && !isInMainGroup(window)
+    }
+
+    // MARK: – Tabbing policy
+
+    /// Detached windows are conceptually a single tab — no "+" button, no tab
+    /// bar. Setting `tabbingMode = .disallowed` removes the "+" affordance and
+    /// blocks accidental new-tab creation; toggling the tab bar off hides the
+    /// strip for cases where the user had "Show Tab Bar" sticky from before
+    /// the drag-out.
+    ///
+    /// The work is done both immediately and after a short delay because the
+    /// drag-out animation can leave `tabGroup` / `isTabBarVisible` in flux for
+    /// a frame or two before settling.
+    func applyTabbingPolicy(to window: NSWindow) {
+        enforceTabbingPolicy(on: window)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
+            self?.enforceTabbingPolicy(on: window)
+        }
+    }
+
+    private func enforceTabbingPolicy(on window: NSWindow) {
+        if isInMainGroup(window) {
+            window.tabbingMode = .preferred
+            return
+        }
+        window.tabbingMode = .disallowed
+        // Hide the tab strip whenever it's still visible on a detached window.
+        // No `windows.count` gate: in our model a detached window is always a
+        // singleton, and even if it isn't we'd rather strip the UI than leave
+        // an inconsistent state.
+        if let group = window.tabGroup, group.isTabBarVisible {
+            window.toggleTabBar(nil)
+        }
+    }
+
+    /// Move a detached window's tab back into the main tab group. Called from
+    /// the WebView context menu's "Re-attach to Main Window" item.
+    func reattach(_ window: NSWindow) {
+        guard let main = mainWindow, window !== main, !isInMainGroup(window) else { return }
+        // addTabbedWindow refuses windows whose tabbingMode is .disallowed, so
+        // briefly flip back to .preferred for the move.
+        window.tabbingMode = .preferred
+        main.addTabbedWindow(window, ordered: .above)
+        window.makeKeyAndOrderFront(nil)
+    }
+
     /// If `url` is already open in a tab, bring that tab to front and return
     /// `true`. Returns `false` when no matching tab exists.
     @discardableResult
     func focusExistingTab(for url: URL) -> Bool {
         let canonical = url.standardizedFileURL
         guard let doc = urlToDoc[canonical] else { return false }
-        guard let wid = windowToDoc.first(where: { $0.value === doc })?.key,
-              let win = NSApp.windows.first(where: { ObjectIdentifier($0) == wid })
-        else { return false }
-        if let group = mainWindow?.tabGroup { group.selectedWindow = win }
+        guard let win = window(for: doc) else { return false }
+        if let group = win.tabGroup { group.selectedWindow = win }
         win.makeKeyAndOrderFront(nil)
         return true
+    }
+
+    /// Returns the NSWindow currently hosting `document`, if we know about it.
+    func window(for document: MarkdownDocument) -> NSWindow? {
+        guard let wid = windowToDoc.first(where: { $0.value === document })?.key
+        else { return nil }
+        return NSApp.windows.first(where: { ObjectIdentifier($0) == wid })
     }
 
     // MARK: – Private
@@ -332,7 +404,12 @@ final class WindowManager: ObservableObject {
             urlToDoc = urlToDoc.filter { $0.value !== doc }
         }
         registered.remove(id)
-        if window === mainWindow { mainWindow = nil }
+        if window === mainWindow {
+            // Promote a surviving tab so future windows still merge into the
+            // group. Without this, closing the original main tab leaves
+            // mainWindow == nil and the next opened window starts a new group.
+            mainWindow = window.tabGroup?.windows.first(where: { $0 !== window })
+        }
     }
 }
 

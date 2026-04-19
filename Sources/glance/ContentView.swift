@@ -25,10 +25,16 @@ struct ContentView: View {
                     themeOverride: themeOverride,
                     findController: find,
                     onOpenInWindow: { url in
-                        // In-page link click (glance-open anchor): honour uniqueness.
+                        // In-page link click (glance-open anchor, e.g. a
+                        // recents-list item). If the file is already open in
+                        // another tab, focus it and close this welcome tab —
+                        // mirrors the "load replaces welcome" path so the
+                        // user doesn't end up with a redundant welcome tab.
                         DispatchQueue.main.async {
                             let canonical = url.standardizedFileURL
-                            if !WindowManager.shared.focusExistingTab(for: canonical) {
+                            if WindowManager.shared.focusExistingTab(for: canonical) {
+                                closeIfEmpty()
+                            } else {
                                 document.load(canonical)
                             }
                         }
@@ -48,18 +54,22 @@ struct ContentView: View {
             // Set tabbing preferences and register with WindowManager.
             // WindowManager.register is idempotent — safe to call on every
             // SwiftUI update; only the first call per window does real work.
-            window.tabbingMode = .preferred
+            // We deliberately don't pin tabbingMode here — the manager owns
+            // that and toggles it to .disallowed for detached windows.
             window.tabbingIdentifier = "glance.main"
             WindowManager.shared.register(window: window, document: document)
         })
         .onAppear {
             // Consume a URL queued by CMD+O when no window was active.
             // Also apply the uniqueness check: if the pending URL is already
-            // open in another tab, focus that tab and leave this one blank.
+            // open in another tab, focus that tab and discard this freshly
+            // created host (it was opened solely to carry the URL).
             if let url = MarkdownDocument.pendingURL {
                 MarkdownDocument.pendingURL = nil
                 DispatchQueue.main.async {
-                    if !WindowManager.shared.focusExistingTab(for: url.standardizedFileURL) {
+                    if WindowManager.shared.focusExistingTab(for: url.standardizedFileURL) {
+                        closeIfEmpty()
+                    } else {
                         document.load(url)
                     }
                 }
@@ -69,9 +79,17 @@ struct ContentView: View {
             // Defer to next runloop tick: synchronously mutating @Published
             // state during initial scene setup races with SwiftUI's layout
             // engine and triggers a RenderBox precondition failure.
+            //
+            // SwiftUI's typed WindowGroup auto-creates a fresh window when an
+            // external URL arrives, then routes the URL here. If the URL is
+            // already open in another tab we focus that tab AND close this
+            // newly-created empty tab so the user doesn't end up with an
+            // orphan welcome page next to their document.
             DispatchQueue.main.async {
                 let canonical = url.standardizedFileURL
-                if !WindowManager.shared.focusExistingTab(for: canonical) {
+                if WindowManager.shared.focusExistingTab(for: canonical) {
+                    closeIfEmpty()
+                } else {
                     document.load(canonical)
                 }
             }
@@ -82,6 +100,8 @@ struct ContentView: View {
                 if let url = url {
                     DispatchQueue.main.async {
                         let canonical = url.standardizedFileURL
+                        // Drop happened on this window deliberately — keep it
+                        // around even if the file is already shown elsewhere.
                         if !WindowManager.shared.focusExistingTab(for: canonical) {
                             document.load(canonical)
                         }
@@ -99,6 +119,14 @@ struct ContentView: View {
         .onReceive(NotificationCenter.default.publisher(for: .glanceOpenInEditor)) { _ in
             document.openInEditor()
         }
+    }
+
+    /// Closes this window if its document is empty (no file loaded). Used
+    /// after focusing an existing tab from URL-handler paths so SwiftUI's
+    /// auto-created host doesn't linger as an orphan welcome page.
+    private func closeIfEmpty() {
+        guard document.currentURL == nil else { return }
+        WindowManager.shared.window(for: document)?.close()
     }
 }
 

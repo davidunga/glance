@@ -17,3 +17,6 @@ Package.pins
 
 # macOS
 .DS_Store
+
+# Claude Code worktrees and runtime state
+.claude/
