@@ -43,7 +43,8 @@ extension Notification.Name {
 ///    is the mechanism that keeps the welcome page from flashing ahead of
 ///    the file — a launch-with-file never renders welcome because the first
 ///    window's onAppear already finds a URL queued.
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
+    @Published var needsWelcomeWindow = false
     /// FIFO queue of file URLs waiting to be absorbed by a document window.
     /// Populated by `applicationWillFinishLaunching` (CLI args) and
     /// `application(_:open:)` (Finder / Apple Events). Drained by
@@ -90,7 +91,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NotificationCenter.default.post(name: .glanceURLsQueued, object: nil)
     }
 
+    /// Prevent SwiftUI from auto-creating an untitled window on launch. We
+    /// control all window creation ourselves: files get windows via the
+    /// standard URL queue mechanism; no-file launches get a welcome window
+    /// from `applicationDidFinishLaunching` via `needsWelcomeWindow`.
+    func applicationShouldOpenUntitledFile(_ sender: NSApplication) -> Bool {
+        return false
+    }
+
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // If no files were queued before launch finished (no Finder open, no
+        // CLI args, no kAEOpenDocuments), show the welcome page. This mirrors
+        // how Preview.app works: suppress untitled-file creation, then
+        // explicitly open the landing window only when nothing else did.
+        if AppDelegate.pendingURLs.isEmpty {
+            needsWelcomeWindow = true
+        }
+
         // Claim kAEOpenDocuments ONLY after launch finishes. On cold launch
         // with a file (`open -a Glance file.md`), AppKit dispatches this
         // event BEFORE `applicationDidFinishLaunching` so the default handler
@@ -149,6 +166,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 @main
 struct GlanceApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
+    @Environment(\.openWindow) private var openWindow
 
     init() {
         // CLI mode: `glance --render file.md` prints rendered HTML and exits.
@@ -178,6 +196,11 @@ struct GlanceApp: App {
                         fontFamily: fontFamily,
                         themeOverride: theme.colorScheme)
                 .preferredColorScheme(theme.colorScheme)
+        }
+        .onChange(of: appDelegate.needsWelcomeWindow) { needs in
+            guard needs else { return }
+            openWindow(value: UUID())
+            appDelegate.needsWelcomeWindow = false
         }
         .windowToolbarStyle(.unifiedCompact)
         .commands {
@@ -484,7 +507,7 @@ final class MarkdownDocument: ObservableObject {
     weak var hostWindow: NSWindow?
 
     init() {
-        self.html = MarkdownDocument.recentsWelcomeHTML()
+        self.html = ""
     }
 
     /// Shows an NSOpenPanel and returns the selected URL, or nil if cancelled.

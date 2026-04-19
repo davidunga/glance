@@ -75,6 +75,8 @@ struct ContentView: View {
             didInitializeOnce = true
             if let url = AppDelegate.popPendingURL() {
                 DispatchQueue.main.async { handleIncomingURL(url) }
+            } else {
+                document.resetToWelcome()
             }
         }
         .onReceive(NotificationCenter.default.publisher(for: .glanceURLsQueued)) { _ in
