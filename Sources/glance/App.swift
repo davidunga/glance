@@ -383,6 +383,7 @@ final class WindowManager: ObservableObject {
     private var windowToDoc = [ObjectIdentifier: MarkdownDocument]()
 
     private var observers: [Any] = []
+    private var isClosingPlaceholders = false
 
     private init() {
         let nc = NotificationCenter.default
@@ -447,6 +448,20 @@ final class WindowManager: ObservableObject {
             urlToDoc = urlToDoc.filter { $0.value !== doc }
         }
         registered.remove(id)
+
+        // When the last visible window closes, also close any hidden placeholder
+        // windows so applicationShouldTerminateAfterLastWindowClosed fires.
+        guard !isClosingPlaceholders else { return }
+        let hasVisible = NSApp.windows.contains { $0.isVisible }
+        guard !hasVisible else { return }
+        let placeholders = windowToDoc.compactMap { (wid, doc) -> NSWindow? in
+            guard doc.currentURL == nil, doc.html.isEmpty else { return nil }
+            return NSApp.windows.first { ObjectIdentifier($0) == wid }
+        }
+        guard !placeholders.isEmpty else { return }
+        isClosingPlaceholders = true
+        placeholders.forEach { $0.close() }
+        isClosingPlaceholders = false
     }
 }
 

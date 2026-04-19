@@ -80,7 +80,10 @@ struct ContentView: View {
                 AppDelegate.openNextAsWelcome = false
                 DispatchQueue.main.async { document.resetToWelcome() }
             } else {
-                DispatchQueue.main.async { closeIfEmpty() }
+                // No file and not a Cmd+N window. Hide (don't close) so the
+                // ContentView stays alive to receive glanceURLsQueued when
+                // application(_:open:) fires for Finder cold-launch-with-file.
+                document.hostWindow?.orderOut(nil)
             }
         }
         .onReceive(NotificationCenter.default.publisher(for: .glanceURLsQueued)) { _ in
@@ -144,6 +147,8 @@ struct ContentView: View {
             if WindowManager.shared.focusExistingWindow(for: url) { continue }
             if !loadedIntoThisWindow, document.currentURL == nil {
                 document.load(url)
+                // Show the window — it may be the hidden launch placeholder.
+                document.hostWindow?.makeKeyAndOrderFront(nil)
                 loadedIntoThisWindow = true
                 continue
             }
