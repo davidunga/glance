@@ -127,6 +127,10 @@ struct GlanceCommands: Commands {
     @Environment(\.openWindow) private var openWindow
 
     var body: some Commands {
+        CommandGroup(after: .appInfo) {
+            // Sits right below "About Glance" in the application menu.
+            Button("Check for Updates…") { Updater.checkForUpdates() }
+        }
         CommandGroup(replacing: .newItem) {
             // CMD+N opens a fresh welcome window. CMD+O opens a file (focusing
             // an existing window if that file is already open). Shift+CMD+N

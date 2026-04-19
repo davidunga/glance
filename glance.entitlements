@@ -25,5 +25,15 @@
     <array>
         <string>/</string>
     </array>
+    <!--
+        The in-app updater replaces /Applications/Glance.app with a newly
+        downloaded bundle. Child processes we spawn (e.g. the detached
+        installer shell script) inherit our sandbox, so they need this
+        write exception to mutate the install path.
+    -->
+    <key>com.apple.security.temporary-exception.files.absolute-path.read-write</key>
+    <array>
+        <string>/Applications/</string>
+    </array>
 </dict>
 </plist>
