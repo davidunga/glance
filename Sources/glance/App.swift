@@ -51,14 +51,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// handler. Main-queue-only — no locking needed.
     static var pendingURLs: [URL] = []
 
-    /// Timestamp of the most recent external file-open event. The
-    /// `.glanceURLsQueued` observer compares this against `lastConsumedEvent`
-    /// so only the FIRST window to react to a notification drains the queue
-    /// — without this guard, N open windows would each try to drain the same
-    /// batch and spawn N copies of every file.
-    static var lastOpenEventTime: Date?
-    static var lastConsumedEventTime: Date?
-
+    /// Set to true by the Cmd+N handler before calling openWindow so the
+    /// new window's onAppear shows the welcome page instead of closing.
+    static var openNextAsWelcome = false
 
     func applicationWillFinishLaunching(_ notification: Notification) {
         // Bypass the "reopen windows on next launch" behavior baked into
@@ -81,7 +76,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let url = URL(fileURLWithPath: arg)
             guard FileManager.default.fileExists(atPath: url.path) else { continue }
             AppDelegate.pendingURLs.append(url.standardizedFileURL)
-            AppDelegate.lastOpenEventTime = Date()
         }
     }
 
@@ -97,7 +91,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func application(_ application: NSApplication, open urls: [URL]) {
         let canonical = urls.map { $0.standardizedFileURL }
         AppDelegate.pendingURLs.append(contentsOf: canonical)
-        AppDelegate.lastOpenEventTime = Date()
         NotificationCenter.default.post(name: .glanceURLsQueued, object: nil)
     }
 
@@ -144,7 +137,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard !urls.isEmpty else { return }
 
         AppDelegate.pendingURLs.append(contentsOf: urls)
-        AppDelegate.lastOpenEventTime = Date()
         NotificationCenter.default.post(name: .glanceURLsQueued, object: nil)
     }
 
@@ -249,6 +241,7 @@ struct GlanceCommands: Commands {
             // an existing window if that file is already open). Shift+CMD+N
             // navigates the current window back to the welcome page.
             Button("New Window") {
+                AppDelegate.openNextAsWelcome = true
                 openWindow(value: UUID())
             }
                 .keyboardShortcut("n", modifiers: .command)
@@ -524,15 +517,7 @@ final class MarkdownDocument: ObservableObject {
         watch(url)
     }
 
-    /// Called by `ContentView.onAppear` when no URL was queued for this
-    /// window. The `html.isEmpty` guard makes it a safe no-op if a file got
-    /// loaded in the meantime or onAppear is fired a second time.
-    func showWelcomeIfEmpty() {
-        guard currentURL == nil, html.isEmpty else { return }
-        html = MarkdownDocument.recentsWelcomeHTML()
-    }
-
-    /// Shift+Cmd+N: navigate this window back to the welcome page. Stops the
+    /// Shift+Cmd+N / Cmd+N welcome: navigate this window back to the welcome page. Stops the
     /// file-watch poller, clears URL/baseURL/title, and re-renders the recents
     /// list. The WindowManager URL index is cleared so a subsequent CMD+O of
     /// the previously-loaded file correctly spawns a new window (since this

@@ -71,52 +71,19 @@ struct ContentView: View {
             WindowManager.shared.register(window: window, document: document)
         })
         .onAppear {
-            // Per-window one-shot: decide whether this window loads a queued
-            // file URL or renders the welcome page.
-            //
-            // Timing on cold launch: `application(_:open:)` fires ~20-100ms
-            // AFTER this onAppear runs — the Apple Event is dispatched on a
-            // later runloop tick. We can't read it synchronously, so:
-            //   1. Try the queue now. Covers CLI args (harvested in
-            //      `applicationWillFinishLaunching`, which runs BEFORE any
-            //      window) and the CMD+O-with-no-window path (URL queued by
-            //      the command handler just before openWindow).
-            //   2. Otherwise defer welcome rendering behind two main-queue
-            //      hops so any pending kAEOpenDocuments event gets a chance
-            //      to dispatch first. If that event arrives, the
-            //      `.glanceURLsQueued` observer below loads the URL into this
-            //      (still-blank) window and welcome never renders.
-            //   3. If no URL shows up by the time we resume, render welcome.
-            //      `showWelcomeIfEmpty` no-ops if a file loaded in the
-            //      meantime (for example, a late warm-app drag onto the
-            //      still-empty window).
             guard !didInitializeOnce else { return }
             didInitializeOnce = true
 
             if let url = AppDelegate.popPendingURL() {
                 DispatchQueue.main.async { handleIncomingURL(url) }
-                return
-            }
-
-            // Two main-queue hops before rendering welcome: lets any pending
-            // kAEOpenDocuments event (cold-launch only) dispatch first so the
-            // notification observer below can load the URL into this blank
-            // window. If no event arrives in the meantime, render welcome.
-            // `showWelcomeIfEmpty` is a no-op if html is already populated.
-            DispatchQueue.main.async {
-                DispatchQueue.main.async {
-                    document.showWelcomeIfEmpty()
-                }
+            } else if AppDelegate.openNextAsWelcome {
+                AppDelegate.openNextAsWelcome = false
+                DispatchQueue.main.async { document.resetToWelcome() }
+            } else {
+                DispatchQueue.main.async { closeIfEmpty() }
             }
         }
         .onReceive(NotificationCenter.default.publisher(for: .glanceURLsQueued)) { _ in
-            // Fires when URLs get queued via kAEOpenDocuments. Only ONE
-            // window must drain each batch, otherwise N open windows would
-            // each spawn a copy for every URL. Guard by timestamp: first
-            // responder claims the event, the rest bail out.
-            guard let evt = AppDelegate.lastOpenEventTime,
-                  evt != AppDelegate.lastConsumedEventTime else { return }
-            AppDelegate.lastConsumedEventTime = evt
             drainQueuedURLs()
         }
         .onDrop(of: [.fileURL], isTargeted: nil) { providers in
@@ -166,16 +133,6 @@ struct ContentView: View {
         }
     }
 
-    /// Drain the pending-URLs queue claimed by this window's notification
-    /// handler. For each URL:
-    ///   - If it's already open in another window → focus that window.
-    ///   - Else if this window is still blank (no file loaded yet; either
-    ///     empty right after launch or showing welcome) → load into this
-    ///     window. That's the path that eliminates the welcome-flash on
-    ///     cold-launch-with-file: the first window stays, and its content
-    ///     transitions from blank / welcome to the file.
-    ///   - Else → stash the URL back on the queue and call openWindow so a
-    ///     fresh host spawns and its onAppear pops the URL.
     private func drainQueuedURLs() {
         let urls = AppDelegate.pendingURLs
         guard !urls.isEmpty else { return }
