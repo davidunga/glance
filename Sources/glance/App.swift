@@ -187,6 +187,39 @@ struct GlanceCommands: Commands {
     }
 }
 
+// MARK: - Recent Documents
+
+/// Persistent recent-file list backed by UserDefaults.standard.
+///
+/// Why not NSDocumentController.recentDocumentURLs?
+/// The app uses ad-hoc signing ("-"), so the code signature changes on every
+/// build. NSDocumentController stores recents in LSSharedFileList keyed to
+/// the signature, meaning the list is silently wiped on every reinstall or
+/// rebuild. UserDefaults.standard writes to the sandbox preferences plist
+/// (~/Library/Containers/local.glance/…/local.glance.plist), which macOS
+/// preserves across reinstalls as long as the bundle identifier is unchanged.
+enum RecentDocuments {
+    private static let key      = "recentDocumentPaths"
+    private static let maxCount = 20
+
+    /// Most-recently-opened URLs whose files still exist on disk.
+    static var urls: [URL] {
+        (UserDefaults.standard.stringArray(forKey: key) ?? [])
+            .map { URL(fileURLWithPath: $0) }
+            .filter { FileManager.default.fileExists(atPath: $0.path) }
+    }
+
+    /// Record `url` as the most-recently-opened file.
+    static func add(_ url: URL) {
+        let path = url.standardizedFileURL.path
+        var paths = UserDefaults.standard.stringArray(forKey: key) ?? []
+        paths.removeAll { $0 == path }          // keep the list duplicate-free
+        paths.insert(path, at: 0)               // most-recent first
+        if paths.count > maxCount { paths = Array(paths.prefix(maxCount)) }
+        UserDefaults.standard.set(paths, forKey: key)
+    }
+}
+
 // MARK: - WindowManager
 
 /// Enforces three invariants for Glance's tabbed-window model:
@@ -351,9 +384,7 @@ final class MarkdownDocument: ObservableObject {
         currentURL = url
         baseURL = url.deletingLastPathComponent()
         title = url.deletingPathExtension().lastPathComponent
-        // macOS-managed recents list. Persists across launches and is the
-        // same store the standard "Open Recent" submenu would read.
-        NSDocumentController.shared.noteNewRecentDocumentURL(url)
+        RecentDocuments.add(url)
         // Keep the URL index in sync so WindowManager can find this tab.
         WindowManager.shared.updateURL(url, for: self)
         reload()
@@ -413,8 +444,7 @@ extension MarkdownDocument {
     /// `class="glance-open"` so the WebView's click bridge routes them to
     /// `document.load(url)` instead of opening externally via NSWorkspace.
     static func recentsWelcomeHTML() -> String {
-        let recents = NSDocumentController.shared.recentDocumentURLs
-            .filter { FileManager.default.fileExists(atPath: $0.path) }
+        let recents = RecentDocuments.urls
 
         let listBody: String
         if recents.isEmpty {
