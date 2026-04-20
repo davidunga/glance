@@ -2,7 +2,7 @@ import SwiftUI
 import UniformTypeIdentifiers
 import AppKit
 
-enum Theme: String, CaseIterable, Identifiable {
+enum Theme: String, CaseIterable, Identifiable, Codable {
     case system, light, dark
     var id: String { rawValue }
     var label: String {
@@ -144,22 +144,20 @@ struct GlanceApp: App {
         NSWindow.allowsAutomaticWindowTabbing = false
     }
 
-    @AppStorage("theme") private var theme: Theme = .system
-    @AppStorage("fontSize") private var fontSize: Double = FontSize.default
-    @AppStorage("fontFamily") private var fontFamily: FontFamily = .sans
+    @StateObject private var config = ConfigStore.shared
 
     var body: some Scene {
         // `for: UUID.self` lets `openWindow(value:)` spin up fresh,
         // fully-independent window instances — one document per window.
         WindowGroup(for: UUID.self) { _ in
-            ContentView(fontSize: fontSize,
-                        fontFamily: fontFamily,
-                        themeOverride: theme.colorScheme)
-                .preferredColorScheme(theme.colorScheme)
+            ContentView(fontSize: config.fontSize,
+                        fontFamily: config.fontFamily,
+                        themeOverride: config.theme.colorScheme)
+                .preferredColorScheme(config.theme.colorScheme)
         }
         .windowToolbarStyle(.unifiedCompact)
         .commands {
-            GlanceCommands(theme: $theme, fontSize: $fontSize, fontFamily: $fontFamily)
+            GlanceCommands(config: config)
         }
     }
 }
@@ -171,7 +169,7 @@ enum FontSize {
     static let step: Double = 1
 }
 
-enum FontFamily: String, CaseIterable, Identifiable {
+enum FontFamily: String, CaseIterable, Identifiable, Codable {
     case sans, serif, mono
     var id: String { rawValue }
     var label: String {
@@ -198,9 +196,7 @@ enum FontFamily: String, CaseIterable, Identifiable {
 // MARK: - Commands
 
 struct GlanceCommands: Commands {
-    @Binding var theme: Theme
-    @Binding var fontSize: Double
-    @Binding var fontFamily: FontFamily
+    @ObservedObject var config: ConfigStore
     @FocusedValue(\.document) private var document
     @FocusedValue(\.findController) private var findController
     @Environment(\.openWindow) private var openWindow
@@ -209,6 +205,7 @@ struct GlanceCommands: Commands {
         CommandGroup(after: .appInfo) {
             // Sits right below "About Glance" in the application menu.
             Button("Check for Updates…") { Updater.checkForUpdates() }
+            Button("Reveal Config…") { config.revealInFinder() }
         }
         CommandGroup(replacing: .newItem) {
             // CMD+N opens a fresh welcome window. CMD+O opens a file (focusing
@@ -265,14 +262,14 @@ struct GlanceCommands: Commands {
             .disabled(document == nil)
         }
         CommandGroup(after: .toolbar) {
-            Button("Actual Size") { fontSize = FontSize.default }
+            Button("Actual Size") { config.fontSize = FontSize.default }
                 .keyboardShortcut("0", modifiers: .command)
             Button("Zoom In") {
-                fontSize = Swift.min(fontSize + FontSize.step, FontSize.max)
+                config.fontSize = Swift.min(config.fontSize + FontSize.step, FontSize.max)
             }
             .keyboardShortcut("=", modifiers: .command)
             Button("Zoom Out") {
-                fontSize = Swift.max(fontSize - FontSize.step, FontSize.min)
+                config.fontSize = Swift.max(config.fontSize - FontSize.step, FontSize.min)
             }
             .keyboardShortcut("-", modifiers: .command)
 
@@ -284,13 +281,13 @@ struct GlanceCommands: Commands {
 
             Divider()
 
-            Picker("Appearance", selection: $theme) {
+            Picker("Appearance", selection: $config.theme) {
                 ForEach(Theme.allCases) { t in
                     Text(t.label).tag(t)
                 }
             }
 
-            Picker("Font", selection: $fontFamily) {
+            Picker("Font", selection: $config.fontFamily) {
                 ForEach(FontFamily.allCases) { f in
                     Text(f.label).tag(f)
                 }
@@ -528,7 +525,39 @@ final class MarkdownDocument: ObservableObject {
 
     func openInEditor() {
         guard let url = currentURL else { return }
-        NSWorkspace.shared.open(url)
+        if let editorApp = ConfigStore.shared.editorApp(for: url) {
+            NSWorkspace.shared.open(
+                [url],
+                withApplicationAt: editorApp,
+                configuration: NSWorkspace.OpenConfiguration()
+            )
+        } else {
+            NSWorkspace.shared.open(url)
+        }
+    }
+
+    /// Present an app picker and open the current file with the selected
+    /// app. Triggered by the ⌥-alternate "Open with…" context-menu item.
+    /// The picked app is persisted in the config as the editor for this
+    /// file's extension, so subsequent "Open in Editor" uses it.
+    func openInChooser() {
+        guard let url = currentURL else { return }
+        let panel = NSOpenPanel()
+        panel.title = "Choose an app to open this file"
+        panel.directoryURL = URL(fileURLWithPath: "/Applications")
+        panel.allowedContentTypes = [.applicationBundle]
+        panel.allowsMultipleSelection = false
+        panel.canChooseDirectories = false
+        guard panel.runModal() == .OK, let app = panel.url else { return }
+        let ext = url.pathExtension
+        if !ext.isEmpty {
+            ConfigStore.shared.setEditor(appPath: app.path, forExtension: ext)
+        }
+        NSWorkspace.shared.open(
+            [url],
+            withApplicationAt: app,
+            configuration: NSWorkspace.OpenConfiguration()
+        )
     }
 
     func copyPath() {

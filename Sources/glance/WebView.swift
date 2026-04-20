@@ -12,6 +12,7 @@ extension Notification.Name {
     static let glanceCopyPath = Notification.Name("glance.copyPath")
     static let glanceRevealInFinder = Notification.Name("glance.revealInFinder")
     static let glanceOpenPanel = Notification.Name("glance.openPanel")
+    static let glanceOpenInChooser = Notification.Name("glance.openInChooser")
 }
 
 /// WKWebView subclass that mirrors its window's `effectiveAppearance` when
@@ -72,6 +73,15 @@ final class GlanceWebView: WKWebView {
         menu.addItem(withTitle: "Open in Editor",
                      action: #selector(openInEditor), keyEquivalent: "")
 
+        // Alternate: appears in place of "Open in Editor" while ⌥ is held,
+        // letting the user pick a different app to open the file with.
+        let openInOther = NSMenuItem(title: "Open with…",
+                                      action: #selector(openInChooser),
+                                      keyEquivalent: "")
+        openInOther.keyEquivalentModifierMask = .option
+        openInOther.isAlternate = true
+        menu.addItem(openInOther)
+
         menu.addItem(.separator())
 
         menu.addItem(withTitle: "Copy Document Text",
@@ -92,6 +102,10 @@ final class GlanceWebView: WKWebView {
 
     @objc private func openInEditor() {
         NotificationCenter.default.post(name: .glanceOpenInEditor, object: nil)
+    }
+
+    @objc private func openInChooser() {
+        NotificationCenter.default.post(name: .glanceOpenInChooser, object: nil)
     }
 
     @objc private func toggleKeepOnTop() {

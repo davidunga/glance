@@ -119,6 +119,9 @@ struct ContentView: View {
         .onReceive(NotificationCenter.default.publisher(for: .glanceRevealInFinder)) { _ in
             document.revealInFinder()
         }
+        .onReceive(NotificationCenter.default.publisher(for: .glanceOpenInChooser)) { _ in
+            document.openInChooser()
+        }
         .onReceive(NotificationCenter.default.publisher(for: .glanceOpenPanel)) { _ in
             guard let url = MarkdownDocument.showOpenPanel() else { return }
             let canonical = url.standardizedFileURL
