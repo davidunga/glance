@@ -46,13 +46,6 @@ extension Notification.Name {
     /// URLs arrive while the app is already running. Listening views drain
     /// `AppDelegate.pendingURLs` and spawn new document windows accordingly.
     static let glanceURLsQueued = Notification.Name("glance.urlsQueued")
-
-    /// Posted once by `applicationDidFinishLaunching`. At this point all
-    /// cold-launch Apple Events (kAEOpenDocuments) have already been
-    /// dispatched, so `pendingURLs` is fully populated and every existing
-    /// window knows whether it received a file. Windows that are still empty
-    /// prompt for one in response to this notification.
-    static let glanceLaunchComplete = Notification.Name("glance.launchComplete")
 }
 
 // MARK: - App delegate
@@ -64,11 +57,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// `ContentView.onAppear` and the `.glanceURLsQueued` notification
     /// handler. Main-queue-only — no locking needed.
     static var pendingURLs: [URL] = []
-
-    /// Set to true once `applicationDidFinishLaunching` completes. Windows
-    /// that appear after this point (Cmd+N, drag-open, etc.) know they're
-    /// warm-app opens and should show welcome immediately if they have no file.
-    static var hasLaunched = false
 
     func applicationWillFinishLaunching(_ notification: Notification) {
         UserDefaults.standard.set(false, forKey: "NSQuitAlwaysKeepsWindows")
@@ -83,9 +71,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     /// Cold-launch file open. Fires (via AppKit's default kAEOpenDocuments
-    /// handler) BEFORE `applicationDidFinishLaunching`, so by the time we
-    /// post `.glanceLaunchComplete`, the URL is already in `pendingURLs` and
-    /// the window knows it should load a file rather than show welcome.
+    /// handler) BEFORE `applicationDidFinishLaunching`. The URL lands in
+    /// `pendingURLs`, where the first window's `onAppear` picks it up; a
+    /// window that finds nothing there simply stays empty.
     func application(_ application: NSApplication, open urls: [URL]) {
         let canonical = urls.map { $0.standardizedFileURL }
         AppDelegate.pendingURLs.append(contentsOf: canonical)
@@ -103,11 +91,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             forEventClass: AEEventClass(kCoreEventClass),
             andEventID: AEEventID(kAEOpenDocuments)
         )
-
-        AppDelegate.hasLaunched = true
-        // All cold-launch Apple Events have now been processed. Any window
-        // that is still empty should show the welcome page.
-        NotificationCenter.default.post(name: .glanceLaunchComplete, object: nil)
     }
 
     /// Warm-app kAEOpenDocuments handler (installed after first launch).
@@ -229,16 +212,10 @@ struct GlanceCommands: Commands {
             Button("Reveal Config…") { config.revealInFinder() }
         }
         CommandGroup(replacing: .newItem) {
-            // CMD+N picks a file and shows it in a NEW window; CMD+O picks a
-            // file and shows it in the CURRENT one. Both focus an existing
-            // window when the chosen file is already open. There's no empty
-            // window state — a window always holds a document.
+            // CMD+N opens an empty window; CMD+O picks a file and shows it in
+            // the current window (focusing an existing window instead when
+            // that file is already open somewhere).
             Button("New Window") {
-                guard let url = MarkdownDocument.showOpenPanel() else { return }
-                let canonical = url.standardizedFileURL
-                guard !WindowManager.shared.focusExistingWindow(for: canonical) else { return }
-                // The fresh window's onAppear pops the queue and loads it.
-                AppDelegate.pendingURLs.append(canonical)
                 openWindow(value: UUID())
             }
                 .keyboardShortcut("n", modifiers: .command)

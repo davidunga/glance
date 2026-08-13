@@ -22,12 +22,6 @@ struct ContentView: View {
     /// queue that was meant for a different (yet-to-be-created) window.
     @State private var didInitializeOnce = false
 
-    /// True once this window has taken a URL off the pending queue. The load
-    /// itself happens one run-loop hop later, so `.glanceLaunchComplete` can
-    /// arrive while `document.currentURL` is still nil — this flag keeps it
-    /// from putting an Open panel in front of a file that's already inbound.
-    @State private var claimedURL = false
-
     @Environment(\.openWindow) private var openWindow
 
     var body: some View {
@@ -66,21 +60,13 @@ struct ContentView: View {
         .onAppear {
             guard !didInitializeOnce else { return }
             didInitializeOnce = true
-            if let url = AppDelegate.popPendingURL() {
-                claimedURL = true
-                DispatchQueue.main.async { handleIncomingURL(url) }
-            } else if AppDelegate.hasLaunched {
-                promptForFile()
-            }
-            // else: cold launch, no URL yet — application(_:open:) may still
-            // fire. Wait for .glanceLaunchComplete before deciding.
+            // A window with no file stays blank — no prompt, no landing page.
+            // It fills in via ⌘O, a drop, or a file arriving from Finder.
+            guard let url = AppDelegate.popPendingURL() else { return }
+            DispatchQueue.main.async { handleIncomingURL(url) }
         }
         .onReceive(NotificationCenter.default.publisher(for: .glanceURLsQueued)) { _ in
             drainQueuedURLs()
-        }
-        .onReceive(NotificationCenter.default.publisher(for: .glanceLaunchComplete)) { _ in
-            guard !claimedURL, document.currentURL == nil else { return }
-            promptForFile()
         }
         .onDrop(of: [.fileURL], isTargeted: nil) { providers in
             guard let provider = providers.first else { return false }
@@ -124,23 +110,6 @@ struct ContentView: View {
     private func closeIfEmpty() {
         guard document.currentURL == nil else { return }
         (document.hostWindow ?? WindowManager.shared.window(for: document))?.close()
-    }
-
-    /// This window has no document, so ask for one. There is no empty state
-    /// to fall back on: cancelling the panel closes the window (and, if it
-    /// was the last one, quits the app).
-    ///
-    /// Dispatched async so the modal panel never runs inside a SwiftUI view
-    /// update / notification delivery.
-    private func promptForFile() {
-        DispatchQueue.main.async {
-            guard document.currentURL == nil else { return }
-            guard let url = MarkdownDocument.showOpenPanel() else {
-                closeIfEmpty()
-                return
-            }
-            handleIncomingURL(url)
-        }
     }
 
     /// Apply the standard uniqueness rule to an incoming URL: if it's already
