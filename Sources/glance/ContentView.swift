@@ -30,7 +30,6 @@ struct ContentView: View {
                     fontSize: fontSize,
                     fontFamily: fontFamily,
                     pageWidth: pageWidth,
-                    showRaw: document.showRaw,
                     themeOverride: themeOverride,
                     findController: find)
                 .frame(minWidth: 640, minHeight: 480)
@@ -56,8 +55,8 @@ struct ContentView: View {
             // The `currentURL` check matters: SwiftUI rebuilds this view when
             // it swaps the window out from under it mid-launch, and a rebuilt
             // view must not grab a second file on top of the one it shows.
-            guard document.isEmpty,
-                  let url = AppDelegate.popURLForNewWindow() else { return }
+            guard document.canClaimFile else { return }
+            guard let url = AppDelegate.popURLForNewWindow() else { return }
             document.claim(url)
             DispatchQueue.main.async { document.load(url) }
         }
@@ -79,24 +78,6 @@ struct ContentView: View {
                 }
             }
             return true
-        }
-        .onReceive(NotificationCenter.default.publisher(for: .glanceReload)) { _ in
-            document.reload()
-        }
-        .onReceive(NotificationCenter.default.publisher(for: .glanceToggleRaw)) { _ in
-            document.toggleRaw()
-        }
-        .onReceive(NotificationCenter.default.publisher(for: .glanceOpenInEditor)) { _ in
-            document.openInEditor()
-        }
-        .onReceive(NotificationCenter.default.publisher(for: .glanceCopyPath)) { _ in
-            document.copyPath()
-        }
-        .onReceive(NotificationCenter.default.publisher(for: .glanceRevealInFinder)) { _ in
-            document.revealInFinder()
-        }
-        .onReceive(NotificationCenter.default.publisher(for: .glanceOpenInChooser)) { _ in
-            document.openInChooser()
         }
     }
 
@@ -128,7 +109,7 @@ struct ContentView: View {
     /// Take one file that has no window of its own yet, if this window is
     /// empty and there is one waiting.
     private func claimUnassignedFile() {
-        guard document.isEmpty, let url = AppDelegate.popUnassignedURL() else { return }
+        guard document.canClaimFile, let url = AppDelegate.popUnassignedURL() else { return }
         document.claim(url)
         DispatchQueue.main.async { document.load(url) }
     }

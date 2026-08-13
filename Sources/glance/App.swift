@@ -23,20 +23,32 @@ enum Theme: String, CaseIterable, Identifiable, Codable {
 
 /// Content column width for the rendered page.
 enum PageWidth: String, CaseIterable, Identifiable, Codable {
-    case centered, full
+    case narrow, wide
     var id: String { rawValue }
     var label: String {
         switch self {
-        case .centered: return "Centered"
-        case .full:     return "Full Width"
+        case .narrow: return "Narrow"
+        case .wide:   return "Wide"
         }
     }
     /// Value for the `--glance-page-width` CSS custom property, which the
-    /// page stylesheet feeds to `main { max-width: … }`.
+    /// page stylesheet feeds to `main { max-width: … }`. Wide is a percentage
+    /// rather than `none` so the text keeps a margin off the window edge at
+    /// any window size.
     var cssMaxWidth: String {
         switch self {
-        case .centered: return "720px"
-        case .full:     return "none"
+        case .narrow: return "720px"
+        case .wide:   return "92%"
+        }
+    }
+
+    /// Accepts the pre-1.0.20 spellings so an existing config.json keeps
+    /// working — an unknown value here would fail the whole decode and reset
+    /// every other setting with it.
+    init(from decoder: Decoder) throws {
+        switch try decoder.singleValueContainer().decode(String.self) {
+        case "wide", "full": self = .wide
+        default:             self = .narrow
         }
     }
 }
@@ -123,12 +135,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             .filter { !WindowManager.shared.focusExistingWindow(for: $0) }
         guard !fresh.isEmpty else { return }
         AppDelegate.pendingURLs.append(contentsOf: fresh)
+
+        // Still launching? Give every file its own new window and don't offer
+        // it to what's already on screen. The window AppKit puts up at launch
+        // is discarded the moment it learns a document is coming, and handing
+        // a file to it resurrects a window SwiftUI has already stopped
+        // updating. Whatever ends up surplus is closed once launch settles.
+        guard AppDelegate.hasFinishedLaunching else {
+            launchedWithFiles = true
+            openWindowsForUnclaimedFiles()
+            return
+        }
+
         // Empty windows absorb what they can, synchronously.
         NotificationCenter.default.post(name: .glanceURLsQueued, object: nil)
         scheduleAssignment()
     }
 
     private var assignmentScheduled = false
+    /// True when this launch was given files to show, so an empty window left
+    /// over once things settle is surplus rather than the intended state.
+    private var launchedWithFiles = false
+    private static var hasFinishedLaunching = false
+    /// True from process start until the launch has settled. While set, a
+    /// document appearing on screen triggers a sweep of surplus empty windows.
+    static var isLaunching = true
 
     /// Settle the queue on the next run-loop turn: offer the files once more
     /// to windows that were mid-creation a moment ago, then give whatever is
@@ -171,7 +202,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     /// Refuse AppKit's untitled-document window — see the class comment.
-    func applicationShouldOpenUntitledFile(_ sender: NSApplication) -> Bool { false }
+    func applicationShouldOpenUntitledFile(_ sender: NSApplication) -> Bool {
+        return false
+    }
 
     /// Dock-icon click with nothing on screen: since we just turned off
     /// AppKit's untitled window, put up an empty one ourselves. Guarded so a
@@ -193,6 +226,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let url = URL(fileURLWithPath: arg)
             guard FileManager.default.fileExists(atPath: url.path) else { continue }
             AppDelegate.pendingURLs.append(url.standardizedFileURL)
+            launchedWithFiles = true
         }
     }
 
@@ -216,8 +250,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             andEventID: AEEventID(kAEOpenDocuments)
         )
 
+        AppDelegate.hasFinishedLaunching = true
         // Hand any file that arrived during launch its window.
         scheduleAssignment()
+        for delay in [1.0, 3.0, 6.0] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+            }
+        }
 
         // Cold-launch Apple Events land around now — sometimes just after this
         // callback returns. Wait a beat before concluding there is nothing to
@@ -225,6 +264,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // neighbour. Still nothing after that: one empty window.
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [self] in
             scheduleAssignment()
+            if launchedWithFiles {
+                WindowManager.shared.closeEmptyWindowsAfterLaunch()
+            }
+            AppDelegate.isLaunching = false
             guard windowsRequested == 0, AppDelegate.windowsAppeared == 0 else { return }
             requestWindows(1)
         }
@@ -489,6 +532,10 @@ final class WindowManager: ObservableObject {
     func register(window: NSWindow, document: MarkdownDocument) {
         let id = ObjectIdentifier(window)
         windowToDoc[id] = document
+        // Outside the one-time block: this runs on every SwiftUI update, which
+        // is what keeps the icon right when a window's file changes.
+        applyTitleIcon(to: window, url: document.currentURL)
+
         guard !registered.contains(id) else { return }
         registered.insert(id)
 
@@ -502,15 +549,64 @@ final class WindowManager: ObservableObject {
     /// Update the URL↔document mapping when a document loads a new file (or
     /// clears its content). Call this from MarkdownDocument.load(_:).
     func updateURL(_ url: URL?, for document: MarkdownDocument) {
+        // Keep the title-bar proxy icon in step with the file on show.
+        if let window = window(for: document) {
+            applyTitleIcon(to: window, url: url)
+        }
         // Drop any stale entry for this document first.
         urlToDoc = urlToDoc.filter { $0.value !== document }
         if let url {
             urlToDoc[url.standardizedFileURL] = document
         }
+        // A document just landed. If we're still launching, any window still
+        // empty is surplus — close it now rather than letting it sit on screen
+        // as a blank flash until the launch settles.
+        guard url != nil, AppDelegate.isLaunching else { return }
+        scheduleLaunchSweep()
+    }
+
+    private var launchSweepScheduled = false
+
+    private func scheduleLaunchSweep() {
+        guard !launchSweepScheduled else { return }
+        launchSweepScheduled = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [self] in
+            launchSweepScheduled = false
+            closeEmptyWindowsAfterLaunch()
+        }
     }
 
     /// Number of live document windows the manager knows about.
     var windowCount: Int { registered.count }
+
+    /// Close windows still sitting empty once a launch that carried files has
+    /// settled. A launch with a file has no business leaving an empty window
+    /// on screen; anything empty at that point is a leftover of AppKit and
+    /// SwiftUI disagreeing about which window the document belongs in.
+    func closeEmptyWindowsAfterLaunch() {
+        guard windowToDoc.values.contains(where: { !$0.isEmpty }) else { return }
+        // Walk every window on screen, not just the registry: AppKit's
+        // discarded launch window drops out of the registry when it closes and
+        // then comes back visible, so the registry alone can't see it.
+        for window in NSApp.windows where window.isVisible {
+            guard Self.isDocumentWindow(window) else { continue }
+            let doc = windowToDoc[ObjectIdentifier(window)]
+            guard doc?.isEmpty ?? true else { continue }
+            window.close()
+        }
+    }
+
+    /// A window of ours, as opposed to a menu, tooltip or text-input panel:
+    /// ours are the ones hosting a `GlanceWebView`.
+    private static func isDocumentWindow(_ window: NSWindow) -> Bool {
+        guard let root = window.contentView else { return false }
+        var stack = [root]
+        while let view = stack.popLast() {
+            if view is GlanceWebView { return true }
+            stack.append(contentsOf: view.subviews)
+        }
+        return false
+    }
 
     /// If `url` is already open in a window, bring that window to front and
     /// return `true`. Returns `false` when no matching window exists.
@@ -521,6 +617,24 @@ final class WindowManager: ObservableObject {
         guard let win = window(for: doc) else { return false }
         win.makeKeyAndOrderFront(nil)
         return true
+    }
+
+    /// Put a small Glance icon left of the title, the way a document window
+    /// shows its file's proxy icon. `representedURL` is what creates the icon
+    /// button at all — without it AppKit draws no icon and there is nothing to
+    /// set an image on — and the image is then swapped for Glance's own, so a
+    /// window reads as a Glance document rather than as whatever icon the file
+    /// type happens to carry. A window with no file gets no icon.
+    private func applyTitleIcon(to window: NSWindow, url: URL?) {
+        guard window.representedURL != url else { return }
+        window.representedURL = url
+        guard url != nil else { return }
+        window.standardWindowButton(.documentIconButton)?.image = NSApp.applicationIconImage
+    }
+
+    /// The document shown in `window`, if it is one of ours.
+    func document(for window: NSWindow) -> MarkdownDocument? {
+        windowToDoc[ObjectIdentifier(window)]
     }
 
     /// Returns the NSWindow currently hosting `document`, if we know about it.
@@ -535,6 +649,7 @@ final class WindowManager: ObservableObject {
     private func windowWillClose(_ window: NSWindow) {
         let id = ObjectIdentifier(window)
         if let doc = windowToDoc.removeValue(forKey: id) {
+            doc.detach()
             urlToDoc = urlToDoc.filter { $0.value !== doc }
         }
         registered.remove(id)
@@ -559,7 +674,11 @@ final class WindowManager: ObservableObject {
 
 final class MarkdownDocument: ObservableObject {
     @Published var html: String
+    /// What the title bar shows: the path, plus a marker when this window is
+    /// showing raw source rather than the rendered document.
     @Published var title: String = "Glance"
+    /// The path part of the title, without the raw marker.
+    private var baseTitle = "Glance"
     /// Directory containing the loaded markdown file. Used as the WKWebView
     /// baseURL so relative links (`./other.md`, `images/foo.png`, …) resolve
     /// against the file's location instead of the app bundle.
@@ -577,8 +696,21 @@ final class MarkdownDocument: ObservableObject {
     /// and land in the same window, leaving another window blank.
     private(set) var claimedURL: URL?
 
+    /// Set when this document's window closes. AppKit discards its launch
+    /// window the moment it learns a document is on the way, so a file
+    /// arriving right then would otherwise be handed to a window that is on
+    /// its way out — which resurrects it as a window SwiftUI has already
+    /// stopped updating, while SwiftUI's replacement window sits empty. A
+    /// detached document takes no more files.
+    private(set) var isDetached = false
+
     /// True when this window has no file and none on the way.
     var isEmpty: Bool { currentURL == nil && claimedURL == nil }
+
+    /// True when this window can still be given a file to show.
+    var canClaimFile: Bool { isEmpty && !isDetached }
+
+    func detach() { isDetached = true }
 
     private var pollTimer: Timer?
     private var lastModified: Date?
@@ -631,7 +763,8 @@ final class MarkdownDocument: ObservableObject {
         if url != currentURL { showRaw = false }
         currentURL = url
         baseURL = url.deletingLastPathComponent()
-        title = Self.displayTitle(for: url)
+        baseTitle = Self.displayTitle(for: url)
+        refreshTitle()
         // Keep the URL index in sync so WindowManager can find this window.
         WindowManager.shared.updateURL(url, for: self)
         reload()
@@ -690,7 +823,12 @@ final class MarkdownDocument: ObservableObject {
     func toggleRaw() {
         guard currentURL != nil else { return }
         showRaw.toggle()
+        refreshTitle()
         reload()
+    }
+
+    private func refreshTitle() {
+        title = showRaw ? "\(baseTitle) [raw]" : baseTitle
     }
 
     func reload() {

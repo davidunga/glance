@@ -4,14 +4,10 @@ import AppKit
 import UniformTypeIdentifiers
 
 extension Notification.Name {
+    /// Posted by the File menu. Every web view hears it, so each one checks
+    /// whether it is in the key window before acting.
     static let glanceExportPDF = Notification.Name("glance.exportPDF")
     static let glancePrint     = Notification.Name("glance.print")
-    static let glanceReload    = Notification.Name("glance.reload")
-    static let glanceToggleRaw = Notification.Name("glance.toggleRaw")
-    static let glanceOpenInEditor = Notification.Name("glance.openInEditor")
-    static let glanceCopyPath = Notification.Name("glance.copyPath")
-    static let glanceRevealInFinder = Notification.Name("glance.revealInFinder")
-    static let glanceOpenInChooser = Notification.Name("glance.openInChooser")
 }
 
 /// WKWebView subclass that mirrors its window's `effectiveAppearance` when
@@ -27,9 +23,17 @@ final class GlanceWebView: WKWebView {
         didSet { applyAppearance() }
     }
 
-    /// Mirrors `MarkdownDocument.showRaw` so the context menu can draw the
-    /// "Show as Raw" checkmark. Kept in sync from `WebView.updateNSView`.
-    var isShowingRaw = false
+    /// The document shown in this web view's window.
+    ///
+    /// Context-menu commands used to go out as app-wide notifications, which
+    /// meant every open window acted on them at once — toggling raw view in
+    /// one window toggled it everywhere, and "Copy Path" copied whichever
+    /// window answered last. Reaching the document directly keeps each menu
+    /// where it was opened.
+    private var document: MarkdownDocument? {
+        guard let window else { return nil }
+        return WindowManager.shared.document(for: window)
+    }
 
     private var windowAppearanceObservation: NSKeyValueObservation?
     private weak var observedWindow: NSWindow?
@@ -106,29 +110,15 @@ final class GlanceWebView: WKWebView {
         let showRaw = NSMenuItem(title: "Show as Raw",
                                  action: #selector(toggleRaw),
                                  keyEquivalent: "")
-        showRaw.state = isShowingRaw ? .on : .off
+        showRaw.state = (document?.showRaw ?? false) ? .on : .off
         menu.addItem(showRaw)
     }
 
-    @objc private func toggleRaw() {
-        NotificationCenter.default.post(name: .glanceToggleRaw, object: nil)
-    }
-
-    @objc private func copyPath() {
-        NotificationCenter.default.post(name: .glanceCopyPath, object: nil)
-    }
-
-    @objc private func revealInFinder() {
-        NotificationCenter.default.post(name: .glanceRevealInFinder, object: nil)
-    }
-
-    @objc private func openInEditor() {
-        NotificationCenter.default.post(name: .glanceOpenInEditor, object: nil)
-    }
-
-    @objc private func openInChooser() {
-        NotificationCenter.default.post(name: .glanceOpenInChooser, object: nil)
-    }
+    @objc private func toggleRaw()      { document?.toggleRaw() }
+    @objc private func copyPath()       { document?.copyPath() }
+    @objc private func revealInFinder() { document?.revealInFinder() }
+    @objc private func openInEditor()   { document?.openInEditor() }
+    @objc private func openInChooser()  { document?.openInChooser() }
 
     @objc private func toggleKeepOnTop() {
         guard let window else { return }
@@ -168,10 +158,6 @@ struct WebView: NSViewRepresentable {
     let fontFamily: FontFamily
     /// Content column width — centered reading column or edge-to-edge.
     let pageWidth: PageWidth
-    /// True while the document shows raw source instead of rendered output.
-    /// Only used to keep the context-menu checkmark in sync; the raw markup
-    /// itself arrives through `html`.
-    let showRaw: Bool
     /// `nil` for the System theme. When non-nil we pin WKWebView's appearance
     /// so `prefers-color-scheme` resolves to the user's choice. When nil the
     /// view tracks its window's `effectiveAppearance` via KVO (see
@@ -193,12 +179,14 @@ struct WebView: NSViewRepresentable {
         // via NSWorkspace (LaunchServices, bypasses our sandbox).
         let userContentController = WKUserContentController()
         userContentController.add(context.coordinator, name: Coordinator.linkBridgeName)
-        let bridgeScript = WKUserScript(
-            source: Self.linkBridgeJS,
-            injectionTime: .atDocumentEnd,
-            forMainFrameOnly: true
-        )
-        userContentController.addUserScript(bridgeScript)
+        userContentController.add(context.coordinator, name: Coordinator.copyBridgeName)
+        for source in [Self.linkBridgeJS, Self.codeCopyJS] {
+            userContentController.addUserScript(WKUserScript(
+                source: source,
+                injectionTime: .atDocumentEnd,
+                forMainFrameOnly: true
+            ))
+        }
         config.userContentController = userContentController
         config.setURLSchemeHandler(GlanceFileSchemeHandler(), forURLScheme: "glance-file")
 
@@ -214,7 +202,6 @@ struct WebView: NSViewRepresentable {
         // Re-bind in case SwiftUI handed us a different controller instance.
         context.coordinator.bind(findController: findController)
         webView.observeWindowAppearance()
-        webView.isShowingRaw = showRaw
 
         // Theme: Light/Dark pin the appearance, System (nil) lets GlanceWebView
         // mirror its window's effectiveAppearance via KVO.
@@ -275,6 +262,41 @@ struct WebView: NSViewRepresentable {
             window.webkit.messageHandlers.glanceLink.postMessage(resolved);
         } catch (err) {}
     }, true);
+    """
+
+    /// Adds an icon-only copy button to every code block. Runs after the page
+    /// is parsed, so it also covers the single big block that whole-file views
+    /// (source, JSON, raw) render.
+    private static let codeCopyJS = """
+    (function () {
+        var COPY = '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><rect x="5.5" y="5.5" width="8" height="8" rx="1.5"/><path d="M10.5 3.5 A1.5 1.5 0 0 0 9 2.5 H4 A1.5 1.5 0 0 0 2.5 4 v5 a1.5 1.5 0 0 0 1 1"/></svg>';
+        var DONE = '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M3 8.5 6.2 11.7 13 5"/></svg>';
+        document.querySelectorAll('pre').forEach(function (pre) {
+            if (pre.querySelector('.glance-copy')) return;
+            var button = document.createElement('button');
+            button.className = 'glance-copy';
+            button.type = 'button';
+            button.title = 'Copy';
+            button.setAttribute('aria-label', 'Copy code');
+            button.innerHTML = COPY;
+            button.addEventListener('click', function (event) {
+                event.preventDefault();
+                event.stopPropagation();
+                var code = pre.querySelector('code');
+                var text = (code || pre).innerText;
+                try {
+                    window.webkit.messageHandlers.glanceCopy.postMessage(text);
+                } catch (err) { return; }
+                button.innerHTML = DONE;
+                button.classList.add('copied');
+                setTimeout(function () {
+                    button.innerHTML = COPY;
+                    button.classList.remove('copied');
+                }, 1200);
+            });
+            pre.appendChild(button);
+        });
+    })();
     """
 
     /// Rewrites relative `<img src="…">` paths to use the custom
@@ -343,6 +365,7 @@ struct WebView: NSViewRepresentable {
 
     final class Coordinator: NSObject, WKNavigationDelegate, WKScriptMessageHandler {
         static let linkBridgeName = "glanceLink"
+        static let copyBridgeName = "glanceCopy"
 
         weak var webView: WKWebView?
         var lastHTML: String?
@@ -359,11 +382,20 @@ struct WebView: NSViewRepresentable {
 
         func userContentController(_ userContentController: WKUserContentController,
                                    didReceive message: WKScriptMessage) {
-            guard message.name == Self.linkBridgeName,
-                  let body = message.body as? String,
-                  let url = URL(string: body) else { return }
-            // Link click → user's default app via LaunchServices.
-            NSWorkspace.shared.open(url)
+            guard let body = message.body as? String else { return }
+            switch message.name {
+            case Self.copyBridgeName:
+                // A code block's copy button. The page can't reach the
+                // pasteboard itself, so it hands the text over here.
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(body, forType: .string)
+            case Self.linkBridgeName:
+                // Link click → user's default app via LaunchServices.
+                guard let url = URL(string: body) else { return }
+                NSWorkspace.shared.open(url)
+            default:
+                break
+            }
         }
 
         func bind(findController: FindController) {
@@ -391,10 +423,14 @@ struct WebView: NSViewRepresentable {
         func installNotificationHandlers() {
             guard observers.isEmpty else { return }
             let nc = NotificationCenter.default
+            // Both notifications reach every window's coordinator; only the
+            // focused one should put up a dialog.
             observers.append(nc.addObserver(forName: .glanceExportPDF, object: nil, queue: .main) { [weak self] _ in
+                guard self?.webView?.window?.isKeyWindow == true else { return }
                 self?.exportPDF()
             })
             observers.append(nc.addObserver(forName: .glancePrint, object: nil, queue: .main) { [weak self] _ in
+                guard self?.webView?.window?.isKeyWindow == true else { return }
                 self?.printDocument()
             })
 
@@ -545,6 +581,7 @@ struct WebView: NSViewRepresentable {
         border-radius: 5px;
     }
     pre {
+        position: relative;
         background: rgba(0,0,0,0.045);
         padding: 16px 20px;
         border-radius: 10px;
@@ -552,7 +589,36 @@ struct WebView: NSViewRepresentable {
         line-height: 1.55;
         margin: 1.2em 0;
     }
-    pre code { background: none; padding: 0; font-size: 0.86em; }
+    /* One point smaller than the document text, so code sits quieter than
+       prose without going small enough to squint at. */
+    pre code {
+        background: none;
+        padding: 0;
+        font-size: calc(var(--glance-font-size, 16px) - 1px);
+    }
+    .glance-copy {
+        position: absolute;
+        top: 8px;
+        right: 8px;
+        width: 26px;
+        height: 26px;
+        padding: 0;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        border: 1px solid rgba(128,128,128,0.28);
+        border-radius: 6px;
+        background: rgba(128,128,128,0.12);
+        color: #55555a;
+        cursor: pointer;
+        opacity: 0;
+        transition: opacity 0.12s ease, background 0.12s ease;
+    }
+    pre:hover > .glance-copy, .glance-copy:focus-visible { opacity: 1; }
+    .glance-copy:hover { background: rgba(128,128,128,0.24); }
+    .glance-copy.copied { opacity: 1; color: #1a8a3f; }
+    .glance-copy svg { width: 14px; height: 14px; display: block; }
+    @media print { .glance-copy { display: none; } }
     /* Let highlight.js token colors apply but keep our pre background. */
     pre code.hljs {
         background: transparent !important;
@@ -604,6 +670,9 @@ struct WebView: NSViewRepresentable {
         code { background: rgba(255,255,255,0.085); }
         pre  { background: rgba(255,255,255,0.06); }
         blockquote { border-color: #444; color: #a1a1a6; }
+        .glance-copy { color: #b0b0b5; border-color: rgba(255,255,255,0.18); background: rgba(255,255,255,0.08); }
+        .glance-copy:hover { background: rgba(255,255,255,0.16); }
+        .glance-copy.copied { color: #4fd07a; }
         hr   { border-color: rgba(255,255,255,0.12); }
         th   { background: rgba(255,255,255,0.06); }
         th, td { border-color: rgba(255,255,255,0.14); }

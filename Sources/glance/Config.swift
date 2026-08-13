@@ -28,7 +28,7 @@ final class ConfigStore: ObservableObject {
     @Published var theme: Theme = .system              { didSet { persist() } }
     @Published var fontSize: Double = FontSize.default { didSet { persist() } }
     @Published var fontFamily: FontFamily = .sans      { didSet { persist() } }
-    @Published var pageWidth: PageWidth = .centered    { didSet { persist() } }
+    @Published var pageWidth: PageWidth = .narrow      { didSet { persist() } }
     @Published var editor: [EditorRule] = []           { didSet { persist() } }
 
     let configURL: URL
