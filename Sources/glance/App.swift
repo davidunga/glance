@@ -2,7 +2,6 @@ import SwiftUI
 import UniformTypeIdentifiers
 import AppKit
 
-
 enum Theme: String, CaseIterable, Identifiable, Codable {
     case system, light, dark
     var id: String { rawValue }
@@ -126,7 +125,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         AppDelegate.pendingURLs.append(contentsOf: fresh)
         // Empty windows absorb what they can, synchronously.
         NotificationCenter.default.post(name: .glanceURLsQueued, object: nil)
-        openWindowsForUnclaimedFiles()
+        scheduleAssignment()
+    }
+
+    private var assignmentScheduled = false
+
+    /// Settle the queue on the next run-loop turn: offer the files once more
+    /// to windows that were mid-creation a moment ago, then give whatever is
+    /// still unclaimed a window of its own.
+    ///
+    /// The delay is the whole point. Cold-launch files arrive while SwiftUI is
+    /// swapping the launch window out from under its own view — during that
+    /// gap nothing is listening for the queue notification, so the file finds
+    /// no home and the launch window stays blank beside a second window opened
+    /// for the file. That second window is worse than redundant: opened from
+    /// inside an AppKit launch callback, it attaches to a scene that isn't
+    /// live yet and never sees another theme, font or page-width change for as
+    /// long as it stays open.
+    private func scheduleAssignment() {
+        guard !assignmentScheduled else { return }
+        assignmentScheduled = true
+        DispatchQueue.main.async { [self] in
+            assignmentScheduled = false
+            NotificationCenter.default.post(name: .glanceURLsQueued, object: nil)
+            openWindowsForUnclaimedFiles()
+        }
     }
 
     /// Give every still-unclaimed file a window of its own.
@@ -141,7 +164,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func requestWindows(_ count: Int) {
         guard count > 0 else { return }
         windowsRequested += count
-        WindowOpener.openWindows(count)
+        // Never open a window from inside the AppKit callback we're standing
+        // in: SwiftUI's scene has to be live, or the window it builds is a
+        // dead end that ignores every later state change.
+        DispatchQueue.main.async { WindowOpener.openWindows(count) }
     }
 
     /// Refuse AppKit's untitled-document window — see the class comment.
@@ -190,14 +216,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             andEventID: AEEventID(kAEOpenDocuments)
         )
 
-        // Cold-launch Apple Events have all been delivered by now, so
-        // `pendingURLs` is final. Give every still-unclaimed file a window,
-        // and if Glance was launched with nothing at all, put up one empty
-        // window (unless SwiftUI already produced one).
-        openWindowsForUnclaimedFiles()
-        // Launched with nothing to show at all: put up a single empty window.
-        let haveWindows = windowsRequested > 0 || AppDelegate.windowsAppeared > 0
-        if !haveWindows { requestWindows(1) }
+        // Hand any file that arrived during launch its window.
+        scheduleAssignment()
+
+        // Cold-launch Apple Events land around now — sometimes just after this
+        // callback returns. Wait a beat before concluding there is nothing to
+        // show, or a file that arrives late gets an empty window as a
+        // neighbour. Still nothing after that: one empty window.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [self] in
+            scheduleAssignment()
+            guard windowsRequested == 0, AppDelegate.windowsAppeared == 0 else { return }
+            requestWindows(1)
+        }
     }
 
     /// Warm-app kAEOpenDocuments handler (installed after first launch).
@@ -227,14 +257,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return true
     }
 
-    /// Pops the next file waiting for a window. A window opened *for* a
-    /// specific file takes that one first; otherwise it takes anything still
-    /// unassigned (cold-launch CLI arguments land there).
-    static func popPendingURL() -> URL? {
-        let u = assignedURLs.isEmpty
-            ? (pendingURLs.isEmpty ? nil : pendingURLs.removeFirst())
-            : assignedURLs.removeFirst()
-        return u
+    /// For a window that was just created: takes the file it was opened for,
+    /// or failing that any file still waiting (cold-launch CLI arguments land
+    /// there, with no window opened specifically for them).
+    static func popURLForNewWindow() -> URL? {
+        assignedURLs.isEmpty ? popUnassignedURL() : assignedURLs.removeFirst()
+    }
+
+    /// For a window that already exists and is sitting empty. Deliberately
+    /// blind to `assignedURLs`: those files have a window of their own on the
+    /// way, and stealing one would leave that window blank.
+    static func popUnassignedURL() -> URL? {
+        pendingURLs.isEmpty ? nil : pendingURLs.removeFirst()
     }
 }
 
@@ -495,7 +529,6 @@ final class WindowManager: ObservableObject {
         else { return nil }
         return NSApp.windows.first(where: { ObjectIdentifier($0) == wid })
     }
-
 
     // MARK: – Private
 

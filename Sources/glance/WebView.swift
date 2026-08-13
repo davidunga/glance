@@ -32,6 +32,7 @@ final class GlanceWebView: WKWebView {
     var isShowingRaw = false
 
     private var windowAppearanceObservation: NSKeyValueObservation?
+    private weak var observedWindow: NSWindow?
 
     /// WKWebView's internals call `registerForDraggedTypes` repeatedly (on
     /// init, after viewDidMoveToWindow, after page loads, …). A one-shot
@@ -45,11 +46,24 @@ final class GlanceWebView: WKWebView {
 
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
+        observeWindowAppearance()
+        applyAppearance()
+    }
+
+    /// Point the appearance observation at the window this view is actually
+    /// in. Called from `viewDidMoveToWindow` *and* from every `updateNSView`,
+    /// because AppKit hands this view a different window than it started with
+    /// — SwiftUI swaps windows during launch — and a view that happened to be
+    /// window-less the last time this ran would otherwise never track
+    /// appearance again, leaving the page stuck in the scheme it first
+    /// rendered while every other window follows along.
+    func observeWindowAppearance() {
+        guard observedWindow !== window else { return }
         windowAppearanceObservation?.invalidate()
+        observedWindow = window
         windowAppearanceObservation = window?.observe(\.effectiveAppearance, options: [.new]) { [weak self] _, _ in
             self?.applyAppearance()
         }
-        applyAppearance()
     }
 
     // MARK: - Context menu
@@ -131,11 +145,12 @@ final class GlanceWebView: WKWebView {
         let name: NSAppearance.Name
         if let forced = forcedAppearance {
             name = forced
-        } else if let windowAppearance = window?.effectiveAppearance,
-                  let best = windowAppearance.bestMatch(from: [.aqua, .darkAqua]) {
-            name = best
         } else {
-            name = .aqua
+            // No window yet (mid-launch, or between window swaps): fall back
+            // to the app's own appearance rather than assuming light, which
+            // would render a dark-mode document on a white page.
+            let source = window?.effectiveAppearance ?? NSApp.effectiveAppearance
+            name = source.bestMatch(from: [.aqua, .darkAqua]) ?? .aqua
         }
         if appearance?.name != name {
             appearance = NSAppearance(named: name)
@@ -198,6 +213,7 @@ struct WebView: NSViewRepresentable {
     func updateNSView(_ webView: GlanceWebView, context: Context) {
         // Re-bind in case SwiftUI handed us a different controller instance.
         context.coordinator.bind(findController: findController)
+        webView.observeWindowAppearance()
         webView.isShowingRaw = showRaw
 
         // Theme: Light/Dark pin the appearance, System (nil) lets GlanceWebView

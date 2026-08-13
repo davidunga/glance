@@ -44,14 +44,7 @@ struct ContentView: View {
         .navigationTitle(document.title)
         .focusedSceneValue(\.document, document)
         .focusedSceneValue(\.findController, find)
-        .background(WindowAccessor { window in
-            // `register` is idempotent — safe to call on every SwiftUI update;
-            // only the first call per window does real work. The manager pins
-            // tabbingMode = .disallowed and isRestorable = false so each
-            // window stays standalone and fresh launches don't resurrect the
-            // previous session.
-            WindowManager.shared.register(window: window, document: document)
-        })
+        .background(WindowAccessor(configure: configureWindow))
         .onAppear {
             guard !didInitializeOnce else { return }
             didInitializeOnce = true
@@ -64,7 +57,7 @@ struct ContentView: View {
             // it swaps the window out from under it mid-launch, and a rebuilt
             // view must not grab a second file on top of the one it shows.
             guard document.isEmpty,
-                  let url = AppDelegate.popPendingURL() else { return }
+                  let url = AppDelegate.popURLForNewWindow() else { return }
             document.claim(url)
             DispatchQueue.main.async { document.load(url) }
         }
@@ -112,9 +105,32 @@ struct ContentView: View {
     /// remaining file. Windows never spawn windows, so no two of them can
     /// claim the same file and leave a blank one behind.
     private func drainQueuedURLs() {
-        guard document.isEmpty else { return }
-        guard let url = AppDelegate.popPendingURL() else { return }
-        document.load(url)
+        claimUnassignedFile()
+    }
+
+    /// Runs whenever SwiftUI attaches or updates this window.
+    ///
+    /// `register` is idempotent — only the first call per window does real
+    /// work; the manager pins tabbingMode = .disallowed and isRestorable =
+    /// false so each window stays standalone and fresh launches don't
+    /// resurrect the previous session.
+    ///
+    /// The late pull matters as much: `onAppear` may have run before the file
+    /// was queued, and the queue notification may have arrived while SwiftUI
+    /// was swapping this window out from under the view. This closure runs on
+    /// every update, so it is the one signal that reliably outlives that
+    /// churn.
+    private func configureWindow(_ window: NSWindow) {
+        WindowManager.shared.register(window: window, document: document)
+        claimUnassignedFile()
+    }
+
+    /// Take one file that has no window of its own yet, if this window is
+    /// empty and there is one waiting.
+    private func claimUnassignedFile() {
+        guard document.isEmpty, let url = AppDelegate.popUnassignedURL() else { return }
+        document.claim(url)
+        DispatchQueue.main.async { document.load(url) }
     }
 }
 
