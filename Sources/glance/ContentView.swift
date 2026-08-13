@@ -5,6 +5,7 @@ import AppKit
 struct ContentView: View {
     let fontSize: Double
     let fontFamily: FontFamily
+    let pageWidth: PageWidth
     /// `nil` means the user picked the "System" theme. Forwarded to the
     /// WebView so it can drop its explicit `appearance` and inherit from the
     /// window — that way OS / window appearance changes propagate live.
@@ -21,6 +22,12 @@ struct ContentView: View {
     /// queue that was meant for a different (yet-to-be-created) window.
     @State private var didInitializeOnce = false
 
+    /// True once this window has taken a URL off the pending queue. The load
+    /// itself happens one run-loop hop later, so `.glanceLaunchComplete` can
+    /// arrive while `document.currentURL` is still nil — this flag keeps it
+    /// from putting an Open panel in front of a file that's already inbound.
+    @State private var claimedURL = false
+
     @Environment(\.openWindow) private var openWindow
 
     var body: some View {
@@ -30,24 +37,10 @@ struct ContentView: View {
                     fileURL: document.currentURL,
                     fontSize: fontSize,
                     fontFamily: fontFamily,
+                    pageWidth: pageWidth,
+                    showRaw: document.showRaw,
                     themeOverride: themeOverride,
-                    findController: find,
-                    onOpenInWindow: { url in
-                        // In-page link click (glance-open anchor, e.g. a
-                        // recents-list item). If the file is already open in
-                        // another window, focus it and close this welcome
-                        // window — mirrors the "load replaces welcome" path
-                        // so the user doesn't end up with a redundant
-                        // welcome window.
-                        DispatchQueue.main.async {
-                            let canonical = url.standardizedFileURL
-                            if WindowManager.shared.focusExistingWindow(for: canonical) {
-                                closeIfEmpty()
-                            } else {
-                                document.load(canonical)
-                            }
-                        }
-                    })
+                    findController: find)
                 .frame(minWidth: 640, minHeight: 480)
 
             if find.isVisible {
@@ -74,9 +67,10 @@ struct ContentView: View {
             guard !didInitializeOnce else { return }
             didInitializeOnce = true
             if let url = AppDelegate.popPendingURL() {
+                claimedURL = true
                 DispatchQueue.main.async { handleIncomingURL(url) }
             } else if AppDelegate.hasLaunched {
-                document.resetToWelcome()
+                promptForFile()
             }
             // else: cold launch, no URL yet — application(_:open:) may still
             // fire. Wait for .glanceLaunchComplete before deciding.
@@ -85,8 +79,8 @@ struct ContentView: View {
             drainQueuedURLs()
         }
         .onReceive(NotificationCenter.default.publisher(for: .glanceLaunchComplete)) { _ in
-            guard document.currentURL == nil else { return }
-            document.resetToWelcome()
+            guard !claimedURL, document.currentURL == nil else { return }
+            promptForFile()
         }
         .onDrop(of: [.fileURL], isTargeted: nil) { providers in
             guard let provider = providers.first else { return false }
@@ -107,8 +101,8 @@ struct ContentView: View {
         .onReceive(NotificationCenter.default.publisher(for: .glanceReload)) { _ in
             document.reload()
         }
-        .onReceive(NotificationCenter.default.publisher(for: .glanceCopyText)) { _ in
-            document.copySourceText()
+        .onReceive(NotificationCenter.default.publisher(for: .glanceToggleRaw)) { _ in
+            document.toggleRaw()
         }
         .onReceive(NotificationCenter.default.publisher(for: .glanceOpenInEditor)) { _ in
             document.openInEditor()
@@ -122,23 +116,31 @@ struct ContentView: View {
         .onReceive(NotificationCenter.default.publisher(for: .glanceOpenInChooser)) { _ in
             document.openInChooser()
         }
-        .onReceive(NotificationCenter.default.publisher(for: .glanceOpenPanel)) { _ in
-            guard let url = MarkdownDocument.showOpenPanel() else { return }
-            let canonical = url.standardizedFileURL
-            if WindowManager.shared.focusExistingWindow(for: canonical) {
-                closeIfEmpty()
-            } else {
-                document.load(canonical)
-            }
-        }
     }
 
     /// Closes this window if its document is empty (no file loaded). Used
     /// after focusing an existing window from URL-handler paths so SwiftUI's
-    /// auto-created host doesn't linger as an orphan welcome page.
+    /// auto-created host doesn't linger as an orphan empty page.
     private func closeIfEmpty() {
         guard document.currentURL == nil else { return }
         (document.hostWindow ?? WindowManager.shared.window(for: document))?.close()
+    }
+
+    /// This window has no document, so ask for one. There is no empty state
+    /// to fall back on: cancelling the panel closes the window (and, if it
+    /// was the last one, quits the app).
+    ///
+    /// Dispatched async so the modal panel never runs inside a SwiftUI view
+    /// update / notification delivery.
+    private func promptForFile() {
+        DispatchQueue.main.async {
+            guard document.currentURL == nil else { return }
+            guard let url = MarkdownDocument.showOpenPanel() else {
+                closeIfEmpty()
+                return
+            }
+            handleIncomingURL(url)
+        }
     }
 
     /// Apply the standard uniqueness rule to an incoming URL: if it's already

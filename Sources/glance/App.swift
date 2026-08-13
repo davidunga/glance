@@ -21,6 +21,26 @@ enum Theme: String, CaseIterable, Identifiable, Codable {
     }
 }
 
+/// Content column width for the rendered page.
+enum PageWidth: String, CaseIterable, Identifiable, Codable {
+    case centered, full
+    var id: String { rawValue }
+    var label: String {
+        switch self {
+        case .centered: return "Centered"
+        case .full:     return "Full Width"
+        }
+    }
+    /// Value for the `--glance-page-width` CSS custom property, which the
+    /// page stylesheet feeds to `main { max-width: … }`.
+    var cssMaxWidth: String {
+        switch self {
+        case .centered: return "720px"
+        case .full:     return "none"
+        }
+    }
+}
+
 extension Notification.Name {
     /// Posted by `AppDelegate.application(_:open:)` when one or more file
     /// URLs arrive while the app is already running. Listening views drain
@@ -31,7 +51,7 @@ extension Notification.Name {
     /// cold-launch Apple Events (kAEOpenDocuments) have already been
     /// dispatched, so `pendingURLs` is fully populated and every existing
     /// window knows whether it received a file. Windows that are still empty
-    /// show the welcome page in response to this notification.
+    /// prompt for one in response to this notification.
     static let glanceLaunchComplete = Notification.Name("glance.launchComplete")
 }
 
@@ -152,6 +172,7 @@ struct GlanceApp: App {
         WindowGroup(for: UUID.self) { _ in
             ContentView(fontSize: config.fontSize,
                         fontFamily: config.fontFamily,
+                        pageWidth: config.pageWidth,
                         themeOverride: config.theme.colorScheme)
                 .preferredColorScheme(config.theme.colorScheme)
         }
@@ -208,10 +229,16 @@ struct GlanceCommands: Commands {
             Button("Reveal Config…") { config.revealInFinder() }
         }
         CommandGroup(replacing: .newItem) {
-            // CMD+N opens a fresh welcome window. CMD+O opens a file (focusing
-            // an existing window if that file is already open). Shift+CMD+N
-            // navigates the current window back to the welcome page.
+            // CMD+N picks a file and shows it in a NEW window; CMD+O picks a
+            // file and shows it in the CURRENT one. Both focus an existing
+            // window when the chosen file is already open. There's no empty
+            // window state — a window always holds a document.
             Button("New Window") {
+                guard let url = MarkdownDocument.showOpenPanel() else { return }
+                let canonical = url.standardizedFileURL
+                guard !WindowManager.shared.focusExistingWindow(for: canonical) else { return }
+                // The fresh window's onAppear pops the queue and loads it.
+                AppDelegate.pendingURLs.append(canonical)
                 openWindow(value: UUID())
             }
                 .keyboardShortcut("n", modifiers: .command)
@@ -231,10 +258,6 @@ struct GlanceCommands: Commands {
                 }
             }
             .keyboardShortcut("o", modifiers: .command)
-
-            Button("Reset Window") { document?.resetToWelcome() }
-                .keyboardShortcut("n", modifiers: [.command, .shift])
-                .disabled(document == nil)
         }
         CommandGroup(after: .pasteboard) {
             Divider()
@@ -281,7 +304,7 @@ struct GlanceCommands: Commands {
 
             Divider()
 
-            Picker("Appearance", selection: $config.theme) {
+            Picker("Theme", selection: $config.theme) {
                 ForEach(Theme.allCases) { t in
                     Text(t.label).tag(t)
                 }
@@ -292,40 +315,13 @@ struct GlanceCommands: Commands {
                     Text(f.label).tag(f)
                 }
             }
+
+            Picker("Page Width", selection: $config.pageWidth) {
+                ForEach(PageWidth.allCases) { w in
+                    Text(w.label).tag(w)
+                }
+            }
         }
-    }
-}
-
-// MARK: - Recent Documents
-
-/// Persistent recent-file list backed by UserDefaults.standard.
-///
-/// Why not NSDocumentController.recentDocumentURLs?
-/// The app uses ad-hoc signing ("-"), so the code signature changes on every
-/// build. NSDocumentController stores recents in LSSharedFileList keyed to
-/// the signature, meaning the list is silently wiped on every reinstall or
-/// rebuild. UserDefaults.standard writes to the sandbox preferences plist
-/// (~/Library/Containers/local.glance/…/local.glance.plist), which macOS
-/// preserves across reinstalls as long as the bundle identifier is unchanged.
-enum RecentDocuments {
-    private static let key      = "recentDocumentPaths"
-    private static let maxCount = 20
-
-    /// Most-recently-opened URLs whose files still exist on disk.
-    static var urls: [URL] {
-        (UserDefaults.standard.stringArray(forKey: key) ?? [])
-            .map { URL(fileURLWithPath: $0) }
-            .filter { FileManager.default.fileExists(atPath: $0.path) }
-    }
-
-    /// Record `url` as the most-recently-opened file.
-    static func add(_ url: URL) {
-        let path = url.standardizedFileURL.path
-        var paths = UserDefaults.standard.stringArray(forKey: key) ?? []
-        paths.removeAll { $0 == path }          // keep the list duplicate-free
-        paths.insert(path, at: 0)               // most-recent first
-        if paths.count > maxCount { paths = Array(paths.prefix(maxCount)) }
-        UserDefaults.standard.set(paths, forKey: key)
     }
 }
 
@@ -339,7 +335,7 @@ enum RecentDocuments {
 ///   - `windowToDoc`: which document lives in which window (populated by
 ///     `ContentView.WindowAccessor` via `register`).
 ///   - `urlToDoc`: which document currently displays which URL (populated by
-///     `MarkdownDocument.load` / `resetToWelcome` via `updateURL`).
+///     `MarkdownDocument.load` via `updateURL`).
 ///
 /// Entries are cleaned up on `willCloseNotification`.
 final class WindowManager: ObservableObject {
@@ -375,14 +371,13 @@ final class WindowManager: ObservableObject {
 
         // We never want these windows tabbed together.
         window.tabbingMode = .disallowed
-        // Don't persist window state across launches — fresh launch is always
-        // a welcome page, per the product requirement.
+        // Don't persist window state across launches — a fresh launch either
+        // opens the files it was given or asks for one.
         window.isRestorable = false
     }
 
     /// Update the URL↔document mapping when a document loads a new file (or
-    /// clears its content). Call this from MarkdownDocument.load(_:) /
-    /// resetToWelcome().
+    /// clears its content). Call this from MarkdownDocument.load(_:).
     func updateURL(_ url: URL?, for document: MarkdownDocument) {
         // Drop any stale entry for this document first.
         urlToDoc = urlToDoc.filter { $0.value !== document }
@@ -444,6 +439,10 @@ final class MarkdownDocument: ObservableObject {
     /// baseURL so relative links (`./other.md`, `images/foo.png`, …) resolve
     /// against the file's location instead of the app bundle.
     @Published private(set) var baseURL: URL?
+    /// When true the file's unrendered source text is shown instead of the
+    /// rendered document. Per-window view mode, reset whenever a different
+    /// file is loaded into this window.
+    @Published private(set) var showRaw = false
 
     private(set) var currentURL: URL?
     private var pollTimer: Timer?
@@ -497,30 +496,16 @@ final class MarkdownDocument: ObservableObject {
     }
 
     func load(_ url: URL) {
+        // A new file starts in the normal rendered view, whatever the
+        // previous document in this window was showing.
+        if url != currentURL { showRaw = false }
         currentURL = url
         baseURL = url.deletingLastPathComponent()
         title = Self.displayTitle(for: url)
-        RecentDocuments.add(url)
         // Keep the URL index in sync so WindowManager can find this window.
         WindowManager.shared.updateURL(url, for: self)
         reload()
         watch(url)
-    }
-
-    /// Shift+Cmd+N / Cmd+N welcome: navigate this window back to the welcome page. Stops the
-    /// file-watch poller, clears URL/baseURL/title, and re-renders the recents
-    /// list. The WindowManager URL index is cleared so a subsequent CMD+O of
-    /// the previously-loaded file correctly spawns a new window (since this
-    /// window no longer holds it).
-    func resetToWelcome() {
-        pollTimer?.invalidate()
-        pollTimer = nil
-        lastModified = nil
-        currentURL = nil
-        baseURL = nil
-        title = "Glance"
-        WindowManager.shared.updateURL(nil, for: self)
-        html = MarkdownDocument.recentsWelcomeHTML()
     }
 
     func openInEditor() {
@@ -571,17 +556,19 @@ final class MarkdownDocument: ObservableObject {
         NSWorkspace.shared.activateFileViewerSelecting([url])
     }
 
-    func copySourceText() {
-        guard let url = currentURL,
-              let text = try? String(contentsOf: url, encoding: .utf8) else { return }
-        NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(text, forType: .string)
+    /// Flip between the rendered document and its raw source text.
+    func toggleRaw() {
+        guard currentURL != nil else { return }
+        showRaw.toggle()
+        reload()
     }
 
     func reload() {
         guard let url = currentURL,
               let text = try? String(contentsOf: url, encoding: .utf8) else { return }
-        if JsonRenderer.isJsonFile(url) {
+        if showRaw {
+            html = RawRenderer.render(text)
+        } else if JsonRenderer.isJsonFile(url) {
             html = JsonRenderer.render(text)
         } else if CsvRenderer.isCsvFile(url) {
             html = CsvRenderer.render(text, url: url)
@@ -610,134 +597,5 @@ final class MarkdownDocument: ObservableObject {
 
     private func modificationDate(of url: URL) -> Date? {
         (try? FileManager.default.attributesOfItem(atPath: url.path))?[.modificationDate] as? Date
-    }
-}
-
-extension MarkdownDocument {
-    /// The landing page: a list of recent files. No tagline, no usage hints —
-    /// just what the user might want to reopen. Items are anchors with
-    /// `class="glance-open"` so the WebView's click bridge routes them to
-    /// `document.load(url)` instead of opening externally via NSWorkspace.
-    static func recentsWelcomeHTML() -> String {
-        let recents = RecentDocuments.urls
-
-        let listBody: String
-        if recents.isEmpty {
-            listBody = #"<div class="recents-empty">No recent files yet.</div>"#
-        } else {
-            let items = recents.map { url -> String in
-                let path = htmlEscape(prettyPath(url))
-                let href = htmlEscapeAttr(url.absoluteString)
-                return #"""
-                <a class="glance-open recent-item" href="\#(href)">
-                    <div class="recent-path">\#(path)</div>
-                </a>
-                """#
-            }.joined()
-            listBody = #"<div class="recents-list">\#(items)</div>"#
-        }
-
-        return #"""
-        <style>
-        main {
-            max-width: 560px !important;
-            margin: 0 auto !important;
-            padding: 72px 24px !important;
-        }
-        .open-button {
-            display: inline-block;
-            margin: 0 0 36px;
-            color: #0a66d0 !important;
-            font-size: 0.92em;
-            text-decoration: none !important;
-            cursor: pointer;
-            user-select: none;
-        }
-        @media (prefers-color-scheme: dark) {
-            .open-button { color: #4a9dff !important; }
-        }
-        .open-button:hover {
-            text-decoration: underline !important;
-            text-underline-offset: 3px;
-        }
-        .open-hint kbd {
-            font: 1em/1 -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
-            background: rgba(128, 128, 128, 0.14);
-            border: 1px solid rgba(128, 128, 128, 0.30);
-            border-bottom-width: 2px;
-            border-radius: 5px;
-            padding: 1px 6px;
-            color: inherit;
-        }
-        .recents-label {
-            font-size: 0.72em;
-            font-weight: 600;
-            text-transform: uppercase;
-            letter-spacing: 0.08em;
-            color: #8a8a8e;
-            margin: 0 0 10px;
-            padding-bottom: 8px;
-            border-bottom: 1px solid rgba(128, 128, 128, 0.18);
-        }
-        .recents-empty {
-            color: #8a8a8e;
-            font-size: 0.92em;
-            padding: 8px 0;
-        }
-        .recents-list {
-            display: flex;
-            flex-direction: column;
-        }
-        .recent-item {
-            display: block;
-            padding: 12px 14px;
-            margin: 0 -14px;
-            border-radius: 8px;
-            text-decoration: none !important;
-            color: inherit;
-        }
-        .recent-item:hover {
-            background: rgba(128, 128, 128, 0.10);
-        }
-        .recent-path {
-            font-size: 0.9em;
-            font-family: "SF Mono", ui-monospace, Menlo, monospace;
-            white-space: nowrap;
-            overflow: hidden;
-            text-overflow: ellipsis;
-        }
-        </style>
-        <a class="glance-action open-button" href="open">Open…</a>
-        <div class="recents-label">Recents</div>
-        \#(listBody)
-        """#
-    }
-
-    private static func prettyPath(_ url: URL) -> String {
-        let home = FileManager.default.homeDirectoryForCurrentUser.path
-        let path = url.path
-        if path == home { return "~" }
-        if path.hasPrefix(home + "/") {
-            return "~" + path.dropFirst(home.count)
-        }
-        return path
-    }
-
-    private static func htmlEscape(_ s: String) -> String {
-        var out = ""
-        out.reserveCapacity(s.count)
-        for c in s {
-            switch c {
-            case "&": out += "&amp;"
-            case "<": out += "&lt;"
-            case ">": out += "&gt;"
-            default:  out.append(c)
-            }
-        }
-        return out
-    }
-
-    private static func htmlEscapeAttr(_ s: String) -> String {
-        htmlEscape(s).replacingOccurrences(of: "\"", with: "&quot;")
     }
 }

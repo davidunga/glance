@@ -9,9 +9,48 @@ enum MarkdownRenderer {
     }
 }
 
-/// Renders a source-code file as a single highlighted code block.
-/// hljs (already loaded by WebView for fenced markdown blocks) sees the
-/// `language-…` class and runs syntax highlighting on it for free.
+// MARK: - Raw source
+
+/// "Show as Raw": the file's bytes as they are on disk — no markdown
+/// rendering, no syntax highlighting, no reflowing. Long lines scroll
+/// horizontally rather than wrapping, so the text matches what an editor
+/// would show.
+enum RawRenderer {
+    static func render(_ source: String) -> String {
+        """
+        <style>
+        /* Inherits `max-width` from the page stylesheet, so raw view follows
+           the View ▸ Page Width setting like the rendered view does. */
+        main { margin: 24px auto !important; }
+        pre.glance-raw {
+            margin: 0;
+            padding: 0;
+            background: transparent;
+            border-radius: 0;
+            overflow-x: auto;
+        }
+        pre.glance-raw code { font-size: 0.92em; }
+        </style>
+        <pre class="glance-raw"><code class="no-highlight">\(escapeHTML(source))</code></pre>
+        """
+    }
+}
+
+/// Shared HTML text escaper for the non-markdown renderers.
+private func escapeHTML(_ s: String) -> String {
+    var out = ""
+    out.reserveCapacity(s.count)
+    for c in s {
+        switch c {
+        case "&": out += "&amp;"
+        case "<": out += "&lt;"
+        case ">": out += "&gt;"
+        default:  out.append(c)
+        }
+    }
+    return out
+}
+
 // MARK: - JSON
 
 enum JsonRenderer {
@@ -30,7 +69,7 @@ enum JsonRenderer {
         } else {
             pretty = source
         }
-        let escaped = htmlEscape(pretty)
+        let escaped = escapeHTML(pretty)
         return """
         <style>
         main {
@@ -49,20 +88,6 @@ enum JsonRenderer {
         </style>
         <pre class="glance-json"><code class="language-json">\(escaped)</code></pre>
         """
-    }
-
-    private static func htmlEscape(_ s: String) -> String {
-        var out = ""
-        out.reserveCapacity(s.count)
-        for c in s {
-            switch c {
-            case "&": out += "&amp;"
-            case "<": out += "&lt;"
-            case ">": out += "&gt;"
-            default:  out.append(c)
-            }
-        }
-        return out
     }
 }
 
@@ -177,20 +202,6 @@ enum CsvRenderer {
         }
         return rows
     }
-
-    private static func escapeHTML(_ s: String) -> String {
-        var out = ""
-        out.reserveCapacity(s.count)
-        for c in s {
-            switch c {
-            case "&": out += "&amp;"
-            case "<": out += "&lt;"
-            case ">": out += "&gt;"
-            default:  out.append(c)
-            }
-        }
-        return out
-    }
 }
 
 // MARK: - Source code
@@ -222,7 +233,7 @@ enum CodeRenderer {
         } else {
             cls = "no-highlight"
         }
-        let escaped = htmlEscape(source)
+        let escaped = escapeHTML(source)
         // The page's `main` element is a 720px column tuned for prose. Code
         // files want the full width, so override it with a tiny inline style
         // scoped to this page only.
@@ -246,20 +257,6 @@ enum CodeRenderer {
         </style>
         <pre class="glance-codefile"><code class="\(cls)">\(escaped)</code></pre>
         """
-    }
-
-    private static func htmlEscape(_ s: String) -> String {
-        var out = ""
-        out.reserveCapacity(s.count)
-        for c in s {
-            switch c {
-            case "&": out += "&amp;"
-            case "<": out += "&lt;"
-            case ">": out += "&gt;"
-            default:  out.append(c)
-            }
-        }
-        return out
     }
 
     /// Extension → hljs language identifier. Covers the languages most likely

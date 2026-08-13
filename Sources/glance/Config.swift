@@ -28,6 +28,7 @@ final class ConfigStore: ObservableObject {
     @Published var theme: Theme = .system              { didSet { persist() } }
     @Published var fontSize: Double = FontSize.default { didSet { persist() } }
     @Published var fontFamily: FontFamily = .sans      { didSet { persist() } }
+    @Published var pageWidth: PageWidth = .centered    { didSet { persist() } }
     @Published var editor: [EditorRule] = []           { didSet { persist() } }
 
     let configURL: URL
@@ -135,6 +136,7 @@ final class ConfigStore: ObservableObject {
         if let v = p.theme      { theme = v }
         if let v = p.fontSize   { fontSize = v }
         if let v = p.fontFamily { fontFamily = v }
+        if let v = p.pageWidth  { pageWidth = v }
         if let v = p.editor     { editor = v }
     }
 
@@ -147,6 +149,7 @@ final class ConfigStore: ObservableObject {
         let payload = Payload(theme: theme,
                               fontSize: fontSize,
                               fontFamily: fontFamily,
+                              pageWidth: pageWidth,
                               editor: editor)
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
@@ -165,6 +168,7 @@ final class ConfigStore: ObservableObject {
         var theme: Theme?
         var fontSize: Double?
         var fontFamily: FontFamily?
+        var pageWidth: PageWidth?
         var editor: [EditorRule]?
     }
 }

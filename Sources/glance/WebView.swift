@@ -7,11 +7,10 @@ extension Notification.Name {
     static let glanceExportPDF = Notification.Name("glance.exportPDF")
     static let glancePrint     = Notification.Name("glance.print")
     static let glanceReload    = Notification.Name("glance.reload")
-    static let glanceCopyText  = Notification.Name("glance.copyText")
+    static let glanceToggleRaw = Notification.Name("glance.toggleRaw")
     static let glanceOpenInEditor = Notification.Name("glance.openInEditor")
     static let glanceCopyPath = Notification.Name("glance.copyPath")
     static let glanceRevealInFinder = Notification.Name("glance.revealInFinder")
-    static let glanceOpenPanel = Notification.Name("glance.openPanel")
     static let glanceOpenInChooser = Notification.Name("glance.openInChooser")
 }
 
@@ -27,6 +26,10 @@ final class GlanceWebView: WKWebView {
     var forcedAppearance: NSAppearance.Name? {
         didSet { applyAppearance() }
     }
+
+    /// Mirrors `MarkdownDocument.showRaw` so the context menu can draw the
+    /// "Show as Raw" checkmark. Kept in sync from `WebView.updateNSView`.
+    var isShowingRaw = false
 
     private var windowAppearanceObservation: NSKeyValueObservation?
 
@@ -84,12 +87,17 @@ final class GlanceWebView: WKWebView {
 
         menu.addItem(.separator())
 
-        menu.addItem(withTitle: "Copy Document Text",
-                     action: #selector(copyDocumentText), keyEquivalent: "")
+        // Toggles between the rendered document and its unmodified source
+        // text; the checkmark reflects which one is on screen.
+        let showRaw = NSMenuItem(title: "Show as Raw",
+                                 action: #selector(toggleRaw),
+                                 keyEquivalent: "")
+        showRaw.state = isShowingRaw ? .on : .off
+        menu.addItem(showRaw)
     }
 
-    @objc private func copyDocumentText() {
-        NotificationCenter.default.post(name: .glanceCopyText, object: nil)
+    @objc private func toggleRaw() {
+        NotificationCenter.default.post(name: .glanceToggleRaw, object: nil)
     }
 
     @objc private func copyPath() {
@@ -143,17 +151,18 @@ struct WebView: NSViewRepresentable {
     let fileURL: URL?
     let fontSize: Double
     let fontFamily: FontFamily
+    /// Content column width — centered reading column or edge-to-edge.
+    let pageWidth: PageWidth
+    /// True while the document shows raw source instead of rendered output.
+    /// Only used to keep the context-menu checkmark in sync; the raw markup
+    /// itself arrives through `html`.
+    let showRaw: Bool
     /// `nil` for the System theme. When non-nil we pin WKWebView's appearance
     /// so `prefers-color-scheme` resolves to the user's choice. When nil the
     /// view tracks its window's `effectiveAppearance` via KVO (see
     /// `GlanceWebView`), so OS / in-app theme changes propagate live.
     let themeOverride: ColorScheme?
     let findController: FindController
-    /// Called when the user clicks an `<a class="glance-open">` link in the
-    /// rendered page (e.g. an item on the recents landing page). Lets the
-    /// caller load the URL into the *current* document instead of farming it
-    /// out to NSWorkspace.
-    let onOpenInWindow: (URL) -> Void
 
     func makeCoordinator() -> Coordinator { Coordinator() }
 
@@ -165,18 +174,10 @@ struct WebView: NSViewRepresentable {
         // delegate runs — `decidePolicyFor` never sees the click. We work
         // around this by injecting a click listener that calls
         // `e.preventDefault()` and posts the resolved href back to native
-        // through a script message handler.
-        //
-        // Two routes:
-        //   - `glanceLink`: external open via NSWorkspace (LaunchServices,
-        //     bypasses our sandbox).
-        //   - `glanceOpen`: load the URL into the current document. Used for
-        //     `<a class="glance-open">` links such as the recents list on the
-        //     landing page.
+        // through the `glanceLink` script message handler, which opens it
+        // via NSWorkspace (LaunchServices, bypasses our sandbox).
         let userContentController = WKUserContentController()
         userContentController.add(context.coordinator, name: Coordinator.linkBridgeName)
-        userContentController.add(context.coordinator, name: Coordinator.openInWindowName)
-        userContentController.add(context.coordinator, name: Coordinator.actionName)
         let bridgeScript = WKUserScript(
             source: Self.linkBridgeJS,
             injectionTime: .atDocumentEnd,
@@ -189,7 +190,6 @@ struct WebView: NSViewRepresentable {
         let view = GlanceWebView(frame: .zero, configuration: config)
         view.navigationDelegate = context.coordinator
         context.coordinator.webView = view
-        context.coordinator.onOpenInWindow = onOpenInWindow
         context.coordinator.bind(findController: findController)
         context.coordinator.installNotificationHandlers()
         return view
@@ -198,7 +198,7 @@ struct WebView: NSViewRepresentable {
     func updateNSView(_ webView: GlanceWebView, context: Context) {
         // Re-bind in case SwiftUI handed us a different controller instance.
         context.coordinator.bind(findController: findController)
-        context.coordinator.onOpenInWindow = onOpenInWindow
+        webView.isShowingRaw = showRaw
 
         // Theme: Light/Dark pin the appearance, System (nil) lets GlanceWebView
         // mirror its window's effectiveAppearance via KVO.
@@ -209,10 +209,10 @@ struct WebView: NSViewRepresentable {
         @unknown default: webView.forcedAppearance = nil
         }
 
-        // Font size and font family live in CSS custom properties, so when
-        // only those change we can patch them on the existing page via JS —
-        // no full reload, no scroll jump. We still do a full load whenever
-        // the rendered markup itself changed.
+        // Font size, font family and page width live in CSS custom
+        // properties, so when only those change we can patch them on the
+        // existing page via JS — no full reload, no scroll jump. We still do
+        // a full load whenever the rendered markup itself changed.
         if context.coordinator.lastHTML == html {
             if context.coordinator.lastFontSize != fontSize {
                 context.coordinator.lastFontSize = fontSize
@@ -224,10 +224,16 @@ struct WebView: NSViewRepresentable {
                 let js = "document.documentElement.style.setProperty('--glance-font-family', '\(fontFamily.cssStack)');"
                 webView.evaluateJavaScript(js, completionHandler: nil)
             }
+            if context.coordinator.lastPageWidth != pageWidth {
+                context.coordinator.lastPageWidth = pageWidth
+                let js = "document.documentElement.style.setProperty('--glance-page-width', '\(pageWidth.cssMaxWidth)');"
+                webView.evaluateJavaScript(js, completionHandler: nil)
+            }
             return
         }
         context.coordinator.lastFontSize = fontSize
         context.coordinator.lastFontFamily = fontFamily
+        context.coordinator.lastPageWidth = pageWidth
         context.coordinator.currentFilePath = fileURL?.path
         let resolved = resolveLocalPaths(html, base: baseURL)
         context.coordinator.lastHTML = html
@@ -248,17 +254,9 @@ struct WebView: NSViewRepresentable {
         if (raw.charAt(0) === '#') return;
         e.preventDefault();
         try {
-            if (link.classList.contains('glance-action')) {
-                window.webkit.messageHandlers.glanceAction.postMessage(raw);
-                return;
-            }
             var resolved = link.href;
             if (!resolved) return;
-            if (link.classList.contains('glance-open')) {
-                window.webkit.messageHandlers.glanceOpen.postMessage(resolved);
-            } else {
-                window.webkit.messageHandlers.glanceLink.postMessage(resolved);
-            }
+            window.webkit.messageHandlers.glanceLink.postMessage(resolved);
         } catch (err) {}
     }, true);
     """
@@ -308,6 +306,7 @@ struct WebView: NSViewRepresentable {
         :root {
             --glance-font-size: \(Int(fontSize))px;
             --glance-font-family: \(fontFamily.cssStack);
+            --glance-page-width: \(pageWidth.cssMaxWidth);
         }
         \(Self.css)
         \(Self.hljsLightCSS)
@@ -328,14 +327,12 @@ struct WebView: NSViewRepresentable {
 
     final class Coordinator: NSObject, WKNavigationDelegate, WKScriptMessageHandler {
         static let linkBridgeName = "glanceLink"
-        static let openInWindowName = "glanceOpen"
-        static let actionName = "glanceAction"
 
         weak var webView: WKWebView?
         var lastHTML: String?
         var lastFontSize: Double?
         var lastFontFamily: FontFamily?
-        var onOpenInWindow: ((URL) -> Void)?
+        var lastPageWidth: PageWidth?
         private weak var findController: FindController?
         private var observers: [NSObjectProtocol] = []
         var currentFilePath: String?
@@ -346,37 +343,11 @@ struct WebView: NSViewRepresentable {
 
         func userContentController(_ userContentController: WKUserContentController,
                                    didReceive message: WKScriptMessage) {
-            guard let body = message.body as? String else { return }
-
-            if message.name == Self.actionName {
-                // Welcome-page buttons (class="glance-action") post their href
-                // verbatim; route known action names to notifications.
-                DispatchQueue.main.async {
-                    switch body {
-                    case "open":
-                        NotificationCenter.default.post(name: .glanceOpenPanel, object: nil)
-                    default:
-                        break
-                    }
-                }
-                return
-            }
-
-            guard let url = URL(string: body) else { return }
-            switch message.name {
-            case Self.linkBridgeName:
-                // External link → user's default app via LaunchServices.
-                NSWorkspace.shared.open(url)
-            case Self.openInWindowName:
-                // Internal link (e.g. recents list) → load into the focused
-                // document. Hop to main: WKScriptMessageHandler can be called
-                // off-main and document.load mutates @Published state.
-                DispatchQueue.main.async { [weak self] in
-                    self?.onOpenInWindow?(url)
-                }
-            default:
-                break
-            }
+            guard message.name == Self.linkBridgeName,
+                  let body = message.body as? String,
+                  let url = URL(string: body) else { return }
+            // Link click → user's default app via LaunchServices.
+            NSWorkspace.shared.open(url)
         }
 
         func bind(findController: FindController) {
@@ -531,7 +502,7 @@ struct WebView: NSViewRepresentable {
         background: #ffffff;
     }
     main {
-        max-width: 720px;
+        max-width: var(--glance-page-width, 720px);
         margin: 56px auto 96px;
         padding: 0 32px;
     }
