@@ -2,6 +2,7 @@ import SwiftUI
 import UniformTypeIdentifiers
 import AppKit
 
+
 enum Theme: String, CaseIterable, Identifiable, Codable {
     case system, light, dark
     var id: String { rawValue }
@@ -48,8 +49,46 @@ extension Notification.Name {
     static let glanceURLsQueued = Notification.Name("glance.urlsQueued")
 }
 
+/// Bridge to SwiftUI's window-opening action.
+///
+/// `openWindow` is only reachable from inside a scene or view body, but the
+/// code that knows a document needs a window is the app delegate, reacting to
+/// AppKit callbacks. `GlanceApp.body` installs the action here on the way past;
+/// requests that arrive before that are held and flushed on install.
+enum WindowOpener {
+    private static var action: ((UUID) -> Void)?
+    private static var pending = 0
+
+    static func install(_ open: OpenWindowAction) {
+        action = { open(value: $0) }
+        let held = pending
+        pending = 0
+        openWindows(held)
+    }
+
+    static func openWindows(_ count: Int) {
+        guard count > 0 else { return }
+        guard let action else {
+            pending += count
+            return
+        }
+        for _ in 0..<count { action(UUID()) }
+    }
+}
+
 // MARK: - App delegate
 
+/// Every window Glance shows is created here, deliberately.
+///
+/// AppKit will otherwise conjure an "untitled" window of its own whenever the
+/// app is launched or activated without a document (`kAEOpenApplication`) —
+/// which happens *alongside* a document open often enough to be the classic
+/// blank-window-next-to-the-file bug, especially when several copies of the
+/// bundle are registered with LaunchServices. `applicationShouldOpenUntitledFile`
+/// refuses those, and this class opens windows itself instead:
+///
+///   - one window per queued URL, and
+///   - exactly one empty window when Glance is launched with nothing to show.
 final class AppDelegate: NSObject, NSApplicationDelegate {
     /// FIFO queue of file URLs waiting to be absorbed by a document window.
     /// Populated by `applicationWillFinishLaunching` (CLI args) and
@@ -57,6 +96,67 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// `ContentView.onAppear` and the `.glanceURLsQueued` notification
     /// handler. Main-queue-only — no locking needed.
     static var pendingURLs: [URL] = []
+
+    /// How many windows we've asked for so far this launch. Lets
+    /// `applicationDidFinishLaunching` tell "nothing to show, put up an empty
+    /// window" apart from "windows are already on their way".
+    private var windowsRequested = 0
+
+    /// Windows SwiftUI has brought up on its own, counted from
+    /// `ContentView.onAppear`. Deliberately monotonic: SwiftUI tears its
+    /// launch window down and rebuilds it mid-launch, so anything derived from
+    /// the live window list reads zero at exactly the wrong moment and earns
+    /// the app a spurious blank window.
+    static var windowsAppeared = 0
+
+    /// Files that already have a window on the way. Only a freshly created
+    /// window claims these, which is what keeps a burst of opens from
+    /// double-counting: once a file is assigned it leaves `pendingURLs`, so
+    /// the next open can't ask for a second window for it.
+    private static var assignedURLs: [URL] = []
+
+    /// Route incoming file URLs to windows. Files already on screen just get
+    /// focus; the rest are offered to any window that is currently empty; and
+    /// whatever is still unclaimed gets a window of its own.
+    func open(urls: [URL]) {
+        let fresh = urls
+            .map { $0.standardizedFileURL }
+            .filter { !WindowManager.shared.focusExistingWindow(for: $0) }
+        guard !fresh.isEmpty else { return }
+        AppDelegate.pendingURLs.append(contentsOf: fresh)
+        // Empty windows absorb what they can, synchronously.
+        NotificationCenter.default.post(name: .glanceURLsQueued, object: nil)
+        openWindowsForUnclaimedFiles()
+    }
+
+    /// Give every still-unclaimed file a window of its own.
+    func openWindowsForUnclaimedFiles() {
+        let unclaimed = AppDelegate.pendingURLs
+        guard !unclaimed.isEmpty else { return }
+        AppDelegate.pendingURLs.removeAll()
+        AppDelegate.assignedURLs.append(contentsOf: unclaimed)
+        requestWindows(unclaimed.count)
+    }
+
+    func requestWindows(_ count: Int) {
+        guard count > 0 else { return }
+        windowsRequested += count
+        WindowOpener.openWindows(count)
+    }
+
+    /// Refuse AppKit's untitled-document window — see the class comment.
+    func applicationShouldOpenUntitledFile(_ sender: NSApplication) -> Bool { false }
+
+    /// Dock-icon click with nothing on screen: since we just turned off
+    /// AppKit's untitled window, put up an empty one ourselves. Guarded so a
+    /// reopen that races a document open can't add a stray blank window.
+    func applicationShouldHandleReopen(_ sender: NSApplication,
+                                       hasVisibleWindows flag: Bool) -> Bool {
+        if !flag, WindowManager.shared.windowCount == 0, AppDelegate.pendingURLs.isEmpty {
+            requestWindows(1)
+        }
+        return false
+    }
 
     func applicationWillFinishLaunching(_ notification: Notification) {
         UserDefaults.standard.set(false, forKey: "NSQuitAlwaysKeepsWindows")
@@ -75,9 +175,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// `pendingURLs`, where the first window's `onAppear` picks it up; a
     /// window that finds nothing there simply stays empty.
     func application(_ application: NSApplication, open urls: [URL]) {
-        let canonical = urls.map { $0.standardizedFileURL }
-        AppDelegate.pendingURLs.append(contentsOf: canonical)
-        NotificationCenter.default.post(name: .glanceURLsQueued, object: nil)
+        open(urls: urls)
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -91,6 +189,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             forEventClass: AEEventClass(kCoreEventClass),
             andEventID: AEEventID(kAEOpenDocuments)
         )
+
+        // Cold-launch Apple Events have all been delivered by now, so
+        // `pendingURLs` is final. Give every still-unclaimed file a window,
+        // and if Glance was launched with nothing at all, put up one empty
+        // window (unless SwiftUI already produced one).
+        openWindowsForUnclaimedFiles()
+        // Launched with nothing to show at all: put up a single empty window.
+        let haveWindows = windowsRequested > 0 || AppDelegate.windowsAppeared > 0
+        if !haveWindows { requestWindows(1) }
     }
 
     /// Warm-app kAEOpenDocuments handler (installed after first launch).
@@ -113,23 +220,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             urls.append(url.standardizedFileURL)
         }
         guard !urls.isEmpty else { return }
-        AppDelegate.pendingURLs.append(contentsOf: urls)
-        NotificationCenter.default.post(name: .glanceURLsQueued, object: nil)
+        open(urls: urls)
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
-        true
+        return true
     }
 
-    /// Pops the next queued URL, or returns nil if the queue is empty.
+    /// Pops the next file waiting for a window. A window opened *for* a
+    /// specific file takes that one first; otherwise it takes anything still
+    /// unassigned (cold-launch CLI arguments land there).
     static func popPendingURL() -> URL? {
-        pendingURLs.isEmpty ? nil : pendingURLs.removeFirst()
+        let u = assignedURLs.isEmpty
+            ? (pendingURLs.isEmpty ? nil : pendingURLs.removeFirst())
+            : assignedURLs.removeFirst()
+        return u
     }
 }
 
 @main
 struct GlanceApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
+    @Environment(\.openWindow) private var openWindow
 
     init() {
         // CLI mode: `glance --render file.md` prints rendered HTML and exits.
@@ -150,6 +262,8 @@ struct GlanceApp: App {
     @StateObject private var config = ConfigStore.shared
 
     var body: some Scene {
+        // Hand SwiftUI's window opener to the delegate (see `WindowOpener`).
+        let _ = WindowOpener.install(openWindow)
         // `for: UUID.self` lets `openWindow(value:)` spin up fresh,
         // fully-independent window instances — one document per window.
         WindowGroup(for: UUID.self) { _ in
@@ -228,10 +342,8 @@ struct GlanceCommands: Commands {
                 if let doc = document {
                     doc.load(canonical)
                 } else {
-                    // No window at all — queue the URL and spin up a new one.
-                    // The fresh window's onAppear pops the queue and loads it.
-                    AppDelegate.pendingURLs.append(canonical)
-                    openWindow(value: UUID())
+                    // No window at all — let the delegate open one for it.
+                    (NSApp.delegate as? AppDelegate)?.open(urls: [canonical])
                 }
             }
             .keyboardShortcut("o", modifiers: .command)
@@ -363,6 +475,9 @@ final class WindowManager: ObservableObject {
         }
     }
 
+    /// Number of live document windows the manager knows about.
+    var windowCount: Int { registered.count }
+
     /// If `url` is already open in a window, bring that window to front and
     /// return `true`. Returns `false` when no matching window exists.
     @discardableResult
@@ -422,17 +537,21 @@ final class MarkdownDocument: ObservableObject {
     @Published private(set) var showRaw = false
 
     private(set) var currentURL: URL?
+
+    /// The file this window has committed to showing. Set the moment a file is
+    /// claimed — `load` runs a run-loop turn later, and without this marker a
+    /// second file arriving in that gap would find the document still "empty"
+    /// and land in the same window, leaving another window blank.
+    private(set) var claimedURL: URL?
+
+    /// True when this window has no file and none on the way.
+    var isEmpty: Bool { currentURL == nil && claimedURL == nil }
+
     private var pollTimer: Timer?
     private var lastModified: Date?
 
-    /// Weak reference to the NSWindow hosting this document, set by
-    /// `WindowAccessor` as soon as the view's NSView hierarchy has an
-    /// attached window. Needed for the orphan-close path — `WindowManager`'s
-    /// registration is deferred one run-loop hop, so a window spawned in
-    /// response to kAEOpenDocuments might not be in the manager's tables yet
-    /// when its onAppear decides to close itself. This pointer gives us a
-    /// fallback handle we can close directly.
-    weak var hostWindow: NSWindow?
+    /// Reserve this window for `url` ahead of the actual load.
+    func claim(_ url: URL) { claimedURL = url }
 
     init() {
         self.html = ""
@@ -473,6 +592,7 @@ final class MarkdownDocument: ObservableObject {
     }
 
     func load(_ url: URL) {
+        claimedURL = url
         // A new file starts in the normal rendered view, whatever the
         // previous document in this window was showing.
         if url != currentURL { showRaw = false }

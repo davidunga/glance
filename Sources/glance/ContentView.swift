@@ -22,8 +22,6 @@ struct ContentView: View {
     /// queue that was meant for a different (yet-to-be-created) window.
     @State private var didInitializeOnce = false
 
-    @Environment(\.openWindow) private var openWindow
-
     var body: some View {
         ZStack(alignment: .topTrailing) {
             WebView(html: document.html,
@@ -47,23 +45,28 @@ struct ContentView: View {
         .focusedSceneValue(\.document, document)
         .focusedSceneValue(\.findController, find)
         .background(WindowAccessor { window in
-            // Cache the window on the document IMMEDIATELY so orphan-close
-            // paths can find it even before `WindowManager.register` runs.
-            // `register` itself is idempotent — safe to call on every
-            // SwiftUI update; only the first call per window does real work.
-            // The manager pins tabbingMode = .disallowed and isRestorable =
-            // false so each window stays standalone and fresh launches don't
-            // resurrect the previous session.
-            document.hostWindow = window
+            // `register` is idempotent — safe to call on every SwiftUI update;
+            // only the first call per window does real work. The manager pins
+            // tabbingMode = .disallowed and isRestorable = false so each
+            // window stays standalone and fresh launches don't resurrect the
+            // previous session.
             WindowManager.shared.register(window: window, document: document)
         })
         .onAppear {
             guard !didInitializeOnce else { return }
             didInitializeOnce = true
-            // A window with no file stays blank — no prompt, no landing page.
-            // It fills in via ⌘O, a drop, or a file arriving from Finder.
-            guard let url = AppDelegate.popPendingURL() else { return }
-            DispatchQueue.main.async { handleIncomingURL(url) }
+            AppDelegate.windowsAppeared += 1
+            // Claim the file this window was opened for, if there is one. A
+            // window with nothing queued stays blank — no prompt, no landing
+            // page. It fills in via ⌘O, a drop, or a file from Finder.
+            //
+            // The `currentURL` check matters: SwiftUI rebuilds this view when
+            // it swaps the window out from under it mid-launch, and a rebuilt
+            // view must not grab a second file on top of the one it shows.
+            guard document.isEmpty,
+                  let url = AppDelegate.popPendingURL() else { return }
+            document.claim(url)
+            DispatchQueue.main.async { document.load(url) }
         }
         .onReceive(NotificationCenter.default.publisher(for: .glanceURLsQueued)) { _ in
             drainQueuedURLs()
@@ -104,48 +107,14 @@ struct ContentView: View {
         }
     }
 
-    /// Closes this window if its document is empty (no file loaded). Used
-    /// after focusing an existing window from URL-handler paths so SwiftUI's
-    /// auto-created host doesn't linger as an orphan empty page.
-    private func closeIfEmpty() {
-        guard document.currentURL == nil else { return }
-        (document.hostWindow ?? WindowManager.shared.window(for: document))?.close()
-    }
-
-    /// Apply the standard uniqueness rule to an incoming URL: if it's already
-    /// open somewhere, focus that window and close this (otherwise empty)
-    /// host. Otherwise load the file into this window.
-    private func handleIncomingURL(_ url: URL) {
-        let canonical = url.standardizedFileURL
-        if WindowManager.shared.focusExistingWindow(for: canonical) {
-            closeIfEmpty()
-        } else {
-            document.load(canonical)
-        }
-    }
-
+    /// Files have been queued. An empty window takes exactly one of them;
+    /// anything left over is the AppDelegate's problem — it opens a window per
+    /// remaining file. Windows never spawn windows, so no two of them can
+    /// claim the same file and leave a blank one behind.
     private func drainQueuedURLs() {
-        let urls = AppDelegate.pendingURLs
-        guard !urls.isEmpty else { return }
-        AppDelegate.pendingURLs.removeAll()
-
-        var spawnURLs: [URL] = []
-        var loadedIntoThisWindow = false
-        for url in urls {
-            if WindowManager.shared.focusExistingWindow(for: url) { continue }
-            if !loadedIntoThisWindow, document.currentURL == nil {
-                document.load(url)
-                loadedIntoThisWindow = true
-                continue
-            }
-            spawnURLs.append(url)
-        }
-
-        // Re-stash the overflow so each new window's onAppear can pop one.
-        AppDelegate.pendingURLs.append(contentsOf: spawnURLs)
-        for _ in spawnURLs {
-            openWindow(value: UUID())
-        }
+        guard document.isEmpty else { return }
+        guard let url = AppDelegate.popPendingURL() else { return }
+        document.load(url)
     }
 }
 
@@ -281,9 +250,8 @@ private struct WindowAccessor: NSViewRepresentable {
 /// Custom NSView that fires `onMoveToWindow` as soon as it gets attached to
 /// an NSWindow. `viewDidMoveToWindow` runs SYNCHRONOUSLY on the main thread
 /// the moment AppKit wires the view into a window — earlier than any
-/// DispatchQueue.main.async-based approach can observe. That synchronous
-/// timing is what the orphan-close path depends on: it needs a usable
-/// `document.hostWindow` before `ContentView.onAppear` decides what to do.
+/// DispatchQueue.main.async-based approach can observe, so the window is in
+/// `WindowManager`'s tables before anything asks it what is on screen.
 private final class NotifyingView: NSView {
     let onMoveToWindow: (NSWindow) -> Void
 
